@@ -1,0 +1,11 @@
+[dependencies]
+actix-web = "4.9"
+actix-web-actors = "4.3"
+tokio = { version = "1.40", features = ["full"] }
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+rayon = "1.10"
+sv = "0.5" # Adjust version based on rust-sv availability
+log = "0.4"
+env_logger = "0.11"
