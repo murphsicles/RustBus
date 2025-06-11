@@ -1,4 +1,4 @@
-use actix_web::{web, App, HttpServer, HttpResponse, Responder};
+use actix_web::{web, App, HttpServer, HttpResponse, Responder, get};
 use actix_web_actors::ws;
 use async_std::net::TcpStream;
 use serde::{Deserialize, Serialize};
@@ -11,29 +11,41 @@ use dashmap::DashMap;
 use regex::Regex;
 use zmq::Context;
 use backoff::{ExponentialBackoff, future::retry};
+use prometheus::{register_counter, register_gauge, register_histogram, Counter, Gauge, Histogram};
+use dotenvy::dotenv;
+use std::env;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-// Configuration struct for database and node connection
+// Prometheus metrics
+lazy_static::lazy_static! {
+    static ref TXS_INDEXED: Counter = register_counter!("rustbus_txs_indexed_total", "Total transactions indexed").unwrap();
+    static ref BLOCK_PROCESS_TIME: Histogram = register_histogram!("rustbus_block_process_seconds", "Block processing time in seconds").unwrap();
+    static ref ACTIVE_SUBS: Gauge = register_gauge!("rustbus_active_subscriptions", "Number of active WebSocket subscriptions").unwrap();
+}
+
+// Configuration struct
 #[derive(Clone)]
 struct Config {
     db_url: String,
     bsv_node: String,
     zmq_addr: String,
     network: Network,
+    start_height: u64,
+    metrics_port: u16,
 }
 
-// Transaction data stored in the database
+// Transaction data
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct IndexedTx {
     txid: String,
     block_height: i64,
-    tx_type: String, // e.g., "RUN", "MAP", "B", "BCAT", "AIP", "METANET", "STANDARD"
+    tx_type: String,
     op_return: Option<String>,
     tx_hex: String,
 }
 
-// Block header stored in the database
+// Block header
 #[derive(Debug, Serialize, Deserialize)]
 struct BlockHeader {
     block_hash: String,
@@ -41,7 +53,7 @@ struct BlockHeader {
     prev_hash: String,
 }
 
-// Subscription filter for clients
+// Subscription filter
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct Subscription {
     client_id: String,
@@ -49,7 +61,7 @@ struct Subscription {
     op_return_pattern: Option<String>,
 }
 
-// Transaction classifier for protocol detection
+// Transaction classifier
 struct TransactionClassifier {
     protocols: Vec<(String, Regex)>,
 }
@@ -79,7 +91,7 @@ impl TransactionClassifier {
     }
 }
 
-// WebSocket actor for client subscriptions
+// WebSocket actor
 struct Subscriber {
     id: String,
     tx: mpsc::Sender<IndexedTx>,
@@ -90,6 +102,7 @@ impl actix::Actor for Subscriber {
     type Context = ws::WebsocketContext<Self>;
 
     fn started(&mut self, ctx: &mut Self::Context) {
+        ACTIVE_SUBS.inc();
         let tx = self.tx.clone();
         let mut rx = tx.subscribe();
         ctx.run_interval(Duration::from_millis(100), move |act, ctx| {
@@ -102,6 +115,7 @@ impl actix::Actor for Subscriber {
     }
 
     fn stopped(&mut self, _ctx: &mut Self::Context) {
+        ACTIVE_SUBS.dec();
         self.state.subscriptions.remove(&self.id);
         info!("Subscriber {} disconnected", self.id);
     }
@@ -138,7 +152,7 @@ struct AppState {
     tx_channel: mpsc::Sender<IndexedTx>,
 }
 
-// Block fetcher using rust-sv
+// Block fetcher
 struct BlockFetcher {
     node: Node,
 }
@@ -206,7 +220,6 @@ async fn handle_reorg(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut tx = pool.begin().await?;
     
-    // Check if new block's prev_hash matches stored block at height-1
     let prev_block: Option<BlockHeader> = sqlx::query_as(
         "SELECT block_hash, height, prev_hash FROM blocks WHERE height = $1"
     )
@@ -217,7 +230,6 @@ async fn handle_reorg(
     if let Some(prev) = prev_block {
         if prev.block_hash != new_block.prev_hash {
             warn!("Reorg detected at height {}. Rolling back...", new_block.height);
-            // Delete transactions and blocks from this height onward
             sqlx::query("DELETE FROM transactions WHERE block_height >= $1")
                 .bind(new_block.height as i64)
                 .execute(&mut tx)
@@ -227,11 +239,10 @@ async fn handle_reorg(
                 .execute(&mut tx)
                 .await?;
 
-            // Reindex from the fork point
             let mut current_height = new_block.height;
             let mut current_hash = new_block.hash.clone();
             while current_height >= prev.height {
-                let block = fetcher.fetch_block(&current_hash).await?;
+                let block = fetcher.fetch_block(¤t_hash).await?;
                 index_block(&mut tx, &block).await?;
                 current_hash = block.prev_hash.clone();
                 current_height -= 1;
@@ -248,7 +259,6 @@ async fn index_block(
     tx: &mut Transaction<'_, Postgres>,
     block: &Block,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Store block header
     sqlx::query(
         r#"
         INSERT INTO blocks (block_hash, height, prev_hash)
@@ -265,6 +275,69 @@ async fn index_block(
     Ok(())
 }
 
+// Sync historical blocks
+async fn sync_historical_blocks(
+    config: &Config,
+    pool: &Pool<Postgres>,
+    fetcher: &mut BlockFetcher,
+    classifier: &TransactionClassifier,
+    state: &Arc<AppState>,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    let latest_height: Option<i64> = sqlx::query_scalar("SELECT MAX(height) FROM blocks")
+        .fetch_one(pool)
+        .await
+        .unwrap_or(None);
+    let start_height = latest_height.map(|h| h as u64 + 1).unwrap_or(config.start_height);
+    let tip_height = fetcher.get_block_hash(u64::MAX).await.unwrap_or_default().parse::<u64>().unwrap_or(start_height);
+
+    for height in start_height..=tip_height {
+        let block_hash = fetcher.get_block_hash(height).await?;
+        let block = fetcher.fetch_block(&block_hash).await?;
+        let mut db_tx = pool.begin().await?;
+
+        let indexed_txs: Vec<IndexedTx> = block.transactions.par_iter().filter_map(|tx| {
+            match tx.txid() {
+                Ok(_) => Some(IndexedTx {
+                    txid: tx.txid().unwrap().to_string(),
+                    block_height: block.height as i64,
+                    tx_type: classifier.classify(tx),
+                    op_return: extract_op_return(tx),
+                    tx_hex: tx.to_hex(),
+                }),
+                Err(e) => {
+                    warn!("Invalid transaction in block {}: {}", block.height, e);
+                    None
+                }
+            }
+        }).collect();
+
+        for tx in &indexed_txs {
+            sqlx::query(
+                r#"
+                INSERT INTO transactions (txid, block_height, tx_type, op_return, tx_hex)
+                VALUES ($1, $2, $3, $4, $5)
+                ON CONFLICT (txid) DO NOTHING
+                "#
+            )
+            .bind(&tx.txid)
+            .bind(tx.block_height)
+            .bind(&tx.tx_type)
+            .bind(&tx.op_return)
+            .bind(&tx.tx_hex)
+            .execute(&mut db_tx)
+            .await?;
+            TXS_INDEXED.inc();
+        }
+
+        index_block(&mut db_tx, &block).await?;
+        db_tx.commit().await?;
+
+        info!("Synced historical block {} with {} transactions", block.height, indexed_txs.len());
+    }
+
+    Ok(tip_height)
+}
+
 // Fetch and index blocks using ZMQ
 async fn index_blocks(config: Config, pool: Pool<Postgres>, state: Arc<AppState>) {
     let mut fetcher = match BlockFetcher::new(&config.bsv_node, config.network).await {
@@ -275,6 +348,15 @@ async fn index_blocks(config: Config, pool: Pool<Postgres>, state: Arc<AppState>
         }
     };
     let classifier = TransactionClassifier::new();
+
+    // Sync historical blocks
+    let latest_height = match sync_historical_blocks(&config, &pool, &mut fetcher, &classifier, &state).await {
+        Ok(height) => height,
+        Err(e) => {
+            error!("Historical sync failed: {}. Exiting...", e);
+            return;
+        }
+    };
 
     let zmq_context = Context::new();
     let subscriber = zmq_context.socket(zmq::SUB).expect("Failed to create ZMQ socket");
@@ -319,13 +401,11 @@ async fn index_blocks(config: Config, pool: Pool<Postgres>, state: Arc<AppState>
 
             match fetcher.fetch_block(&block_hash).await {
                 Ok(block) => {
-                    // Check for reorg
                     if let Err(e) = handle_reorg(&pool, &mut fetcher, &block).await {
                         warn!("Reorg handling failed: {}. Skipping block {}", e, block_hash);
                         continue;
                     }
 
-                    // Index transactions
                     let indexed_txs: Vec<IndexedTx> = block.transactions.par_iter().filter_map(|tx| {
                         match tx.txid() {
                             Ok(_) => Some(IndexedTx {
@@ -360,6 +440,7 @@ async fn index_blocks(config: Config, pool: Pool<Postgres>, state: Arc<AppState>
                             warn!("Error inserting tx {}: {}", tx.txid, e);
                             continue;
                         }
+                        TXS_INDEXED.inc();
 
                         state.subscriptions.iter().par_bridge().for_each(|entry| {
                             let sub = entry.value();
@@ -369,7 +450,6 @@ async fn index_blocks(config: Config, pool: Pool<Postgres>, state: Arc<AppState>
                         });
                     }
 
-                    // Store block header
                     if let Err(e) = index_block(&mut db_tx, &block).await {
                         warn!("Error indexing block {}: {}. Skipping...", block.height, e);
                         continue;
@@ -381,6 +461,7 @@ async fn index_blocks(config: Config, pool: Pool<Postgres>, state: Arc<AppState>
                     }
 
                     let elapsed = start_time.elapsed();
+                    BLOCK_PROCESS_TIME.observe(elapsed.as_secs_f64());
                     info!(
                         "Indexed block {} with {} transactions in {:.2}s",
                         block.height,
@@ -437,15 +518,79 @@ async fn ws_route(
     ws::start(subscriber, &req, stream)
 }
 
+// REST API: Get transaction by txid
+#[get("/tx/{txid}")]
+async fn get_tx(
+    path: web::Path<String>,
+    state: web::Data<Arc<AppState>>,
+) -> Result<HttpResponse, actix_web::Error> {
+    let txid = path.into_inner();
+    let tx: Option<IndexedTx> = sqlx::query_as(
+        "SELECT txid, block_height, tx_type, op_return, tx_hex FROM transactions WHERE txid = $1"
+    )
+    .bind(&txid)
+    .fetch_optional(&state.db_pool)
+    .await
+    .map_err(|e| actix_web::error::ErrorInternalServerError(e))?;
+
+    match tx {
+        Some(tx) => Ok(HttpResponse::Ok().json(tx)),
+        None => Ok(HttpResponse::NotFound().body("Transaction not found")),
+    }
+}
+
+// REST API: List transactions by type and/or height
+#[get("/txs")]
+async fn list_txs(
+    query: web::Query<std::collections::HashMap<String, String>>,
+    state: web::Data<Arc<AppState>>,
+) -> Result<HttpResponse, actix_web::Error> {
+    let tx_type = query.get("type");
+    let height = query.get("height").and_then(|h| h.parse::<i64>().ok());
+    let limit = query.get("limit").and_then(|l| l.parse::<i64>().ok()).unwrap_or(100);
+
+    let mut query_builder = sqlx::QueryBuilder::new("SELECT txid, block_height, tx_type, op_return, tx_hex FROM transactions WHERE 1=1");
+    if let Some(t) = tx_type {
+        query_builder.push(" AND tx_type = ");
+        query_builder.push_bind(t);
+    }
+    if let Some(h) = height {
+        query_builder.push(" AND block_height = ");
+        query_builder.push_bind(h);
+    }
+    query_builder.push(" LIMIT ");
+    query_builder.push_bind(limit);
+
+    let txs: Vec<IndexedTx> = query_builder
+        .build_query_as()
+        .fetch_all(&state.db_pool)
+        .await
+        .map_err(|e| actix_web::error::ErrorInternalServerError(e))?;
+
+    Ok(HttpResponse::Ok().json(txs))
+}
+
+// Metrics endpoint
+async fn metrics() -> impl Responder {
+    let encoder = prometheus::TextEncoder::new();
+    let metric_families = prometheus::gather();
+    let encoded = encoder.encode_to_string(&metric_families).unwrap_or_default();
+    HttpResponse::Ok().body(encoded)
+}
+
 // Main function
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
+    dotenv().ok();
     env_logger::init();
+
     let config = Config {
-        db_url: "postgres://user:pass@localhost/rustbus".to_string(),
-        bsv_node: "127.0.0.1:18333".to_string(),
-        zmq_addr: "tcp://127.0.0.1:28332".to_string(),
+        db_url: env::var("DATABASE_URL").unwrap_or("postgres://user:pass@localhost/rustbus".to_string()),
+        bsv_node: env::var("BSV_NODE").unwrap_or("127.0.0.1:18333".to_string()),
+        zmq_addr: env::var("ZMQ_ADDR").unwrap_or("tcp://127.0.0.1:28332".to_string()),
         network: Network::Testnet,
+        start_height: env::var("START_HEIGHT").unwrap_or("0".to_string()).parse().unwrap_or(0),
+        metrics_port: env::var("METRICS_PORT").unwrap_or("9090".to_string()).parse().unwrap_or(9090),
     };
 
     let pool = PgPoolOptions::new()
@@ -471,10 +616,26 @@ async fn main() -> std::io::Result<()> {
         }
     });
 
+    // Start metrics server
+    let metrics_config = config.clone();
+    tokio::spawn(async move {
+        HttpServer::new(|| {
+            App::new()
+                .route("/metrics", web::get().to(metrics))
+        })
+        .bind(("0.0.0.0", metrics_config.metrics_port))
+        .expect("Failed to bind metrics server")
+        .run()
+        .await
+        .expect("Metrics server failed");
+    });
+
     HttpServer::new(move || {
         App::new()
             .app_data(web::Data::new(state.clone()))
             .route("/ws", web::get().to(ws_route))
+            .service(get_tx)
+            .service(list_txs)
     })
     .bind("127.0.0.1:8080")?
     .run()
