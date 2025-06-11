@@ -7,6 +7,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 rayon = "1.10"
 sv = "0.5" # Adjust version based on rust-sv availability
+bitcoinsv = { git = "https://github.com/Danconnolly/rust-bitcoinsv", branch = "main" }
 log = "0.4"
 env_logger = "0.11"
 async-std = "1.13"
