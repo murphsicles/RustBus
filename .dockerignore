@@ -1,0 +1,6 @@
+target/
+*.log
+*.md
+.git/
+.github/
+.env
