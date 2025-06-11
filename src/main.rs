@@ -1,5 +1,6 @@
-use actix_web::{web, App, HttpServer, HttpResponse, Responder, get};
-use actix_web_actors::ws;
+use actix_web::{web, App, HttpServer, HttpResponse, Responder, get, post};
+use async_graphql::{Schema, EmptyMutation, EmptySubscription, Object, Context};
+use async_graphql_actix_web::{GraphQLRequest, GraphQLResponse};
 use async_std::net::TcpStream;
 use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Postgres, postgres::PgPoolOptions, Transaction};
@@ -36,7 +37,7 @@ struct Config {
 }
 
 // Transaction data
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, async_graphql::SimpleObject)]
 struct IndexedTx {
     txid: String,
     block_height: i64,
@@ -46,7 +47,7 @@ struct IndexedTx {
 }
 
 // Block header
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, async_graphql::SimpleObject)]
 struct BlockHeader {
     block_hash: String,
     height: i64,
@@ -59,6 +60,61 @@ struct Subscription {
     client_id: String,
     filter_type: Option<String>,
     op_return_pattern: Option<String>,
+}
+
+// GraphQL schema
+struct QueryRoot;
+
+#[Object]
+impl QueryRoot {
+    async fn transaction(&self, ctx: &Context<'_>, txid: String) -> async_graphql::Result<Option<IndexedTx>> {
+        let pool = ctx.data_unchecked::<Pool<Postgres>>();
+        let tx: Option<IndexedTx> = sqlx::query_as(
+            "SELECT txid, block_height, tx_type, op_return, tx_hex FROM transactions WHERE txid = $1"
+        )
+        .bind(&txid)
+        .fetch_optional(pool)
+        .await?;
+        Ok(tx)
+    }
+
+    async fn transactions(
+        &self,
+        ctx: &Context<'_>,
+        tx_type: Option<String>,
+        block_height: Option<i64>,
+        limit: Option<i32>,
+    ) -> async_graphql::Result<Vec<IndexedTx>> {
+        let pool = ctx.data_unchecked::<Pool<Postgres>>();
+        let mut query_builder = sqlx::QueryBuilder::new("SELECT txid, block_height, tx_type, op_return, tx_hex FROM transactions WHERE 1=1");
+        if let Some(t) = tx_type {
+            query_builder.push(" AND tx_type = ");
+            query_builder.push_bind(t);
+        }
+        if let Some(h) = block_height {
+            query_builder.push(" AND block_height = ");
+            query_builder.push_bind(h);
+        }
+        query_builder.push(" LIMIT ");
+        query_builder.push_bind(limit.unwrap_or(100));
+
+        let txs: Vec<IndexedTx> = query_builder
+            .build_query_as()
+            .fetch_all(pool)
+            .await?;
+        Ok(txs)
+    }
+
+    async fn block(&self, ctx: &Context<'_>, height: i64) -> async_graphql::Result<Option<BlockHeader>> {
+        let pool = ctx.data_unchecked::<Pool<Postgres>>();
+        let block: Option<BlockHeader> = sqlx::query_as(
+            "SELECT block_hash, height, prev_hash FROM blocks WHERE height = $1"
+        )
+        .bind(height)
+        .fetch_optional(pool)
+        .await?;
+        Ok(block)
+    }
 }
 
 // Transaction classifier
@@ -150,6 +206,7 @@ struct AppState {
     db_pool: Pool<Postgres>,
     subscriptions: Arc<DashMap<String, Subscription>>,
     tx_channel: mpsc::Sender<IndexedTx>,
+    schema: Schema<QueryRoot, EmptyMutation, EmptySubscription>,
 }
 
 // Block fetcher
@@ -191,24 +248,46 @@ async fn init_db(pool: &Pool<Postgres>) -> Result<(), sqlx::Error> {
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS transactions (
-            txid TEXT PRIMARY KEY,
+            txid TEXT NOT NULL,
             block_height BIGINT NOT NULL,
             tx_type TEXT NOT NULL,
             op_return TEXT,
-            tx_hex TEXT NOT NULL
-        );
+            tx_hex TEXT NOT NULL,
+            PRIMARY KEY (txid, block_height)
+        ) PARTITION BY RANGE (block_height);
         CREATE TABLE IF NOT EXISTS blocks (
-            block_hash TEXT PRIMARY KEY,
+            block_hash TEXT NOT NULL,
             height BIGINT NOT NULL,
-            prev_hash TEXT NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_tx_type ON transactions (tx_type);
-        CREATE INDEX IF NOT EXISTS idx_op_return ON transactions USING gin (op_return gin_trgm_ops);
-        CREATE INDEX IF NOT EXISTS idx_block_height ON blocks (height);
+            prev_hash TEXT NOT NULL,
+            PRIMARY KEY (block_hash, height)
+        ) PARTITION BY RANGE (height);
         "#
     )
     .execute(pool)
     .await?;
+
+    // Create initial partitions (extend as needed for mainnet)
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS transactions_0_100000 PARTITION OF transactions
+            FOR VALUES FROM (0) TO (100000);
+        CREATE TABLE IF NOT EXISTS transactions_100000_200000 PARTITION OF transactions
+            FOR VALUES FROM (100000) TO (200000);
+        CREATE TABLE IF NOT EXISTS blocks_0_100000 PARTITION OF blocks
+            FOR VALUES FROM (0) TO (100000);
+        CREATE TABLE IF NOT EXISTS blocks_100000_200000 PARTITION OF blocks
+            FOR VALUES FROM (100000) TO (200000);
+        CREATE INDEX IF NOT EXISTS idx_tx_type_0_100000 ON transactions_0_100000 (tx_type);
+        CREATE INDEX IF NOT EXISTS idx_op_return_0_100000 ON transactions_0_100000 USING gin (op_return gin_trgm_ops);
+        CREATE INDEX IF NOT EXISTS idx_block_height_0_100000 ON blocks_0_100000 (height);
+        CREATE INDEX IF NOT EXISTS idx_tx_type_100000_200000 ON transactions_100000_200000 (tx_type);
+        CREATE INDEX IF NOT EXISTS idx_op_return_100000_200000 ON transactions_100000_200000 USING gin (op_return gin_trgm_ops);
+        CREATE INDEX IF NOT EXISTS idx_block_height_100000_200000 ON blocks_100000_200000 (height);
+        "#
+    )
+    .execute(pool)
+    .await?;
+
     Ok(())
 }
 
@@ -263,7 +342,7 @@ async fn index_block(
         r#"
         INSERT INTO blocks (block_hash, height, prev_hash)
         VALUES ($1, $2, $3)
-        ON CONFLICT (block_hash) DO NOTHING
+        ON CONFLICT (block_hash, height) DO NOTHING
         "#
     )
     .bind(&block.hash)
@@ -316,7 +395,7 @@ async fn sync_historical_blocks(
                 r#"
                 INSERT INTO transactions (txid, block_height, tx_type, op_return, tx_hex)
                 VALUES ($1, $2, $3, $4, $5)
-                ON CONFLICT (txid) DO NOTHING
+                ON CONFLICT (txid, block_height) DO NOTHING
                 "#
             )
             .bind(&tx.txid)
@@ -349,7 +428,6 @@ async fn index_blocks(config: Config, pool: Pool<Postgres>, state: Arc<AppState>
     };
     let classifier = TransactionClassifier::new();
 
-    // Sync historical blocks
     let latest_height = match sync_historical_blocks(&config, &pool, &mut fetcher, &classifier, &state).await {
         Ok(height) => height,
         Err(e) => {
@@ -427,7 +505,7 @@ async fn index_blocks(config: Config, pool: Pool<Postgres>, state: Arc<AppState>
                             r#"
                             INSERT INTO transactions (txid, block_height, tx_type, op_return, tx_hex)
                             VALUES ($1, $2, $3, $4, $5)
-                            ON CONFLICT (txid) DO NOTHING
+                            ON CONFLICT (txid, block_height) DO NOTHING
                             "#
                         )
                         .bind(&tx.txid)
@@ -518,6 +596,25 @@ async fn ws_route(
     ws::start(subscriber, &req, stream)
 }
 
+// GraphQL route
+#[post("/graphql")]
+async fn graphql(
+    state: web::Data<Arc<AppState>>,
+    request: GraphQLRequest,
+) -> GraphQLResponse {
+    state.schema.execute(request.into_inner()).await.into()
+}
+
+// GraphiQL playground
+#[get("/graphql")]
+async fn graphiql() -> HttpResponse {
+    HttpResponse::Ok()
+        .content_type("text/html; charset=utf-8")
+        .body(async_graphql::http::playground_source(
+            async_graphql::http::PlaygroundConfig::new("/graphql"),
+        ))
+}
+
 // REST API: Get transaction by txid
 #[get("/tx/{txid}")]
 async fn get_tx(
@@ -585,10 +682,13 @@ async fn main() -> std::io::Result<()> {
     env_logger::init();
 
     let config = Config {
-        db_url: env::var("DATABASE_URL").unwrap_or("postgres://user:pass@localhost/rustbus".to_string()),
-        bsv_node: env::var("BSV_NODE").unwrap_or("127.0.0.1:18333".to_string()),
+        db_url: env::var("DATABASE_URL").expect("DATABASE_URL must be set"),
+        bsv_node: env::var("BSV_NODE").unwrap_or("127.0.0.1:8333".to_string()),
         zmq_addr: env::var("ZMQ_ADDR").unwrap_or("tcp://127.0.0.1:28332".to_string()),
-        network: Network::Testnet,
+        network: match env::var("NETWORK").unwrap_or("mainnet".to_string()).as_str() {
+            "testnet" => Network::Testnet,
+            _ => Network::Mainnet,
+        },
         start_height: env::var("START_HEIGHT").unwrap_or("0".to_string()).parse().unwrap_or(0),
         metrics_port: env::var("METRICS_PORT").unwrap_or("9090".to_string()).parse().unwrap_or(9090),
     };
@@ -601,10 +701,14 @@ async fn main() -> std::io::Result<()> {
     init_db(&pool).await.expect("Failed to initialize database");
 
     let (tx_channel, mut rx_channel) = mpsc::channel::<IndexedTx>(1000);
+    let schema = Schema::build(QueryRoot, EmptyMutation, EmptySubscription)
+        .data(pool.clone())
+        .finish();
     let state = Arc::new(AppState {
         db_pool: pool.clone(),
         subscriptions: Arc::new(DashMap::new()),
         tx_channel,
+        schema,
     });
 
     let index_config = config.clone();
@@ -616,7 +720,6 @@ async fn main() -> std::io::Result<()> {
         }
     });
 
-    // Start metrics server
     let metrics_config = config.clone();
     tokio::spawn(async move {
         HttpServer::new(|| {
@@ -636,6 +739,7 @@ async fn main() -> std::io::Result<()> {
             .route("/ws", web::get().to(ws_route))
             .service(get_tx)
             .service(list_txs)
+            .service(web::resource("/graphql").route(web::post().to(graphql)).route(web::get().to(graphiql)))
     })
     .bind("127.0.0.1:8080")?
     .run()
