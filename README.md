@@ -47,9 +47,26 @@ BSV_NODE=127.0.0.1:8333
 ZMQ_ADDR=tcp://127.0.0.1:28332
 NETWORK=mainnet
 START_HEIGHT=800000
-METRICS_PORT=8000Set Up PostgreSQL:Create the database:sudo -u postgres createdb rustbus
-sudo -u postgres psql -c "ALTER USER postgres WITH PASSWORD 'pass';"Apply the partitioned schema:psql -h localhost -U postgres -d rustbus -f schema.sqlBuild and Run with Docker:docker build -t rustbus:latest .
-docker run -d --name rustbus -p 8080:8080 -p 8000:9000 --env-file .env rustbus:latest:latestVerify:GraphQL Playground: Open http://localhost:8080/graphql.Health Check: curl http://localhost:8000/api/v1/health.Metrics: curl http://localhost:8000/metrics.Check indexed blocks:psql -d rustbus -c "SELECT COUNT(*) FROM blocks;"🛠️ Environment VariablesConfigure RustBus via .env or Docker -e flags:VariableDescriptionDefault/ExampleDATABASE_URLPostgreSQL connection stringpostgres://user:pass:pass@localhost/rustbusBSVBSV_NODEnode RPC address (host:port)127.0.1:8333ZMQZMQ_ADDRZeroMQ address for block notificationstcp://127.0.0.1:28332NETWORKBlockchain networkmainnet or testnetSTARTSTART_HEIGHTStarting block height for sync800000METRICSMETRICS_PORTPort for Prometheus metrics8000📚 API ExamplesGraphQL QueryFetch a transaction by TXID:query {
+METRICS_PORT=8000
+Set Up 
+PostgreSQL:
+Create the database:
+```bash
+sudo -u postgres createdb rustbus
+sudo -u postgres psql -c "ALTER USER postgres WITH PASSWORD 'pass';"A
+pply the partitioned schema:
+```
+psql -h localhost -U postgres -d rustbus -f schema.sql
+Build and Run with Docker:
+```bash
+docker build -t rustbus:latest.
+docker run -d --name rustbus -p 8080:8080 -p 8000:9000 --env-file .env rustbus:latest:latestVerify:GraphQL Playground: Open http://localhost:8080/graphql.Health Check: curl http://localhost:8000/api/v1/health.Metrics: curl http://localhost:8000/metrics.Check indexed blocks:psql -d rustbus -c "SELECT COUNT(*) FROM blocks;"🛠️ Environment VariablesConfigure RustBus via .env or Docker -e flags:VariableDescriptionDefault/ExampleDATABASE_URLPostgreSQL connection stringpostgres://user:pass:pass@localhost/rustbusBSVBSV_NODEnode RPC address (host:port)127.0.1:8333ZMQZMQ_ADDRZeroMQ address for block notificationstcp://127.0.0.1:28332NETWORKBlockchain networkmainnet or testnetSTARTSTART_HEIGHTStarting block height for sync800000METRICSMETRICS_PORTPort for Prometheus metrics8000
+```
+📚 API Examples
+GraphQL Query
+Fetch a transaction by TXID:
+```bash
+query {
   transaction(txid: "abc123...") {
     txid
     block_height
@@ -58,9 +75,28 @@ docker run -d --name rustbus -p 8080:8080 -p 8000:9000 --env-file .env rustbus:l
   }
 }Run via http://localhost:8080/graphql or curl:curl -X POST -H "Content-Type: application/json" \
   -d '{"query":"query { transaction(txid: \"abc123...\") { txid block_height tx_type op_return } }"}' \
-  http://localhost:8080/graphqlREST APIGet transactions by type:curl "http://localhost:8080/txs?type=RUN&limit=10"Get a single transaction:curl http://localhost:8080/tx/abc123...WebSocket SubscriptionSubscribe to RUN transactions:wscat -c ws://127.0.0.1:8080/wsSend:{"client_id": "test1", "filter_type": "RUN"}Prometheus MetricsMonitor indexing performance:curl http://localhost:8000/metricsExample output:rustbus_txs_indexed_total{network="mainnet"} 123456
+  http://localhost:8080/graphql
+  ```
+  
+  
+  REST API
+  Get transactions by type:
+  ```bash
+  curl "http://localhost:8080/txs?type=RUN&limit=10"
+```
+Get a single transaction:
+```bash
+curl http://localhost:8080/tx/abc123...WebSocket
+```
+Subscription
+Subscribe to RUN transactions:
+```bash
+wscat -c ws://127.0.0.1:8080/wsSend:{"client_id": "test1", "filter_type": "RUN"}Prometheus MetricsMonitor indexing performance:curl http://localhost:8000/metricsExample output:rustbus_txs_indexed_total{network="mainnet"} 123456
 rustbus_block_process_seconds{network="mainnet"} 0.05
-rustbus_active_subscriptions 10🗄️ Database SchemaRustBus uses partitioned PostgreSQL tables for scalability. Key tables (schema.sql):transactions:CREATE TABLE transactions (
+rustbus_active_subscriptions 10🗄️
+```
+Database Schema
+RustBus uses partitioned PostgreSQL tables for scalability. Key tables (schema.sql):transactions:CREATE TABLE transactions (hi
     txid TEXT NOT NULL,
     block_height BIGINT NOT NULL,
     tx_type TEXT NOT NULL,
