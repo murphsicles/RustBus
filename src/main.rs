@@ -1,8 +1,9 @@
 use actix_web::{web, App, HttpServer, HttpResponse, Responder};
 use actix_web_actors::ws;
+use async_std::net::TcpStream;
 use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Postgres, postgres::PgPoolOptions};
-use sv::{block::Block, transaction::Transaction};
+use sv::{block::Block, network::Network, node::Node, transaction::Transaction};
 use tokio::sync::mpsc;
 use log::{info, error};
 use rayon::prelude::*;
@@ -62,6 +63,27 @@ struct AppState {
     tx_channel: mpsc::Sender<IndexedTx>,
 }
 
+// Block fetcher using rust-sv
+struct BlockFetcher {
+    node: Node,
+}
+
+impl BlockFetcher {
+    async fn new(node_addr: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        let network = Network::Mainnet; // Adjust for Testnet if needed
+        let stream = TcpStream::connect(node_addr).await?;
+        let node = Node::new(stream, network, None)?;
+        Ok(BlockFetcher { node })
+    }
+
+    async fn fetch_block(&mut self, height: u64) -> Result<Block, Box<dyn std::error::Error>> {
+        // Request block by height (simplified; real impl may need header sync)
+        let block_hash = self.node.get_block_hash(height).await?;
+        let block = self.node.get_block(&block_hash).await?;
+        Ok(block)
+    }
+}
+
 // Initialize database schema
 async fn init_db(pool: &Pool<Postgres>) -> Result<(), sqlx::Error> {
     sqlx::query(
@@ -84,61 +106,64 @@ async fn init_db(pool: &Pool<Postgres>) -> Result<(), sqlx::Error> {
 
 // Fetch and index blocks
 async fn index_blocks(config: Config, pool: Pool<Postgres>, tx_channel: mpsc::Sender<IndexedTx>) {
+    let mut fetcher = BlockFetcher::new(&config.bsv_node)
+        .await
+        .expect("Failed to connect to BSV node");
+    let mut current_height = 0; // Start from genesis or a checkpoint
+
     loop {
-        // Simulated block fetching (replace with rust-sv P2P connection)
-        let block = fetch_block(&config.bsv_node).await.unwrap_or_default();
+        match fetcher.fetch_block(current_height).await {
+            Ok(block) => {
+                // Process transactions in parallel
+                let indexed_txs: Vec<IndexedTx> = block.transactions.par_iter().map(|tx| {
+                    let tx_type = classify_transaction(tx);
+                    let op_return = extract_op_return(tx);
+                    IndexedTx {
+                        txid: tx.txid().to_string(),
+                        block_height: block.height as i64,
+                        tx_type,
+                        op_return,
+                        tx_hex: tx.to_hex(),
+                    }
+                }).collect();
 
-        // Process transactions in parallel
-        let indexed_txs: Vec<IndexedTx> = block.transactions.par_iter().map(|tx| {
-            let tx_type = classify_transaction(tx);
-            let op_return = extract_op_return(tx);
-            IndexedTx {
-                txid: tx.txid().to_string(),
-                block_height: block.height,
-                tx_type,
-                op_return,
-                tx_hex: tx.to_hex(),
+                // Batch insert to database
+                for tx in &indexed_txs {
+                    sqlx::query(
+                        r#"
+                        INSERT INTO transactions (txid, block_height, tx_type, op_return, tx_hex)
+                        VALUES ($1, $2, $3, $4, $5)
+                        ON CONFLICT (txid) DO NOTHING
+                        "#
+                    )
+                    .bind(&tx.txid)
+                    .bind(tx.block_height)
+                    .bind(&tx.tx_type)
+                    .bind(&tx.op_return)
+                    .bind(&tx.tx_hex)
+                    .execute(&pool)
+                    .await
+                    .unwrap_or_else(|e| error!("Error inserting tx: {}", e));
+
+                    // Send to subscribers
+                    let _ = tx_channel.send(tx.clone()).await;
+                }
+
+                info!("Indexed block {} with {} transactions", block.height, indexed_txs.len());
+                current_height += 1;
             }
-        }).collect();
-
-        // Batch insert to database
-        for tx in &indexed_txs {
-            sqlx::query(
-                r#"
-                INSERT INTO transactions (txid, block_height, tx_type, op_return, tx_hex)
-                VALUES ($1, $2, $3, $4, $5)
-                ON CONFLICT (txid) DO NOTHING
-                "#
-            )
-            .bind(&tx.txid)
-            .bind(tx.block_height)
-            .bind(&tx.tx_type)
-            .bind(&tx.op_return)
-            .bind(&tx.tx_hex)
-            .execute(&pool)
-            .await
-            .unwrap_or_else(|e| error!("Error inserting tx: {}", e));
-
-            // Send to subscribers
-            let _ = tx_channel.send(tx.clone()).await;
+            Err(e) => {
+                error!("Error fetching block {}: {}", current_height, e);
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await; // Retry delay
+            }
         }
-
-        info!("Indexed block {} with {} transactions", block.height, indexed_txs.len());
-        tokio::time::sleep(std::time::Duration::from_secs(600)).await; // Simulate 10-min block time
+        // Simulate block time (remove in production; rely on node notifications)
+        tokio::time::sleep(std::time::Duration::from_secs(600)).await;
     }
-}
-
-// Simulated block fetching (replace with rust-sv)
-async fn fetch_block(_node: &str) -> Option<Block> {
-    Some(Block {
-        height: 0,
-        transactions: vec![Transaction::default()], // Placeholder
-    })
 }
 
 // Classify transaction type (simplified)
 fn classify_transaction(tx: &Transaction) -> String {
-    // Implement logic to detect RUN, MAP, etc.
     if tx.outputs.iter().any(|out| out.script.is_op_return()) {
         "RUN".to_string() // Example
     } else {
@@ -172,8 +197,8 @@ async fn ws_route(
 async fn main() -> std::io::Result<()> {
     env_logger::init();
     let config = Config {
-        db_url: "postgres://user:pass@localhost/junglebus".to_string(),
-        bsv_node: "bsv-node:8333".to_string(),
+        db_url: "postgres://user:pass@localhost/rustbus".to_string(),
+        bsv_node: "bsv-node:8333".to_string(), // Replace with actual BSV node
     };
 
     // Initialize database
