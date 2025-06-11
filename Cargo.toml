@@ -9,3 +9,5 @@ rayon = "1.10"
 sv = "0.5" # Adjust version based on rust-sv availability
 log = "0.4"
 env_logger = "0.11"
+async-std = "1.13"
+uuid = { version = "1.10", features = ["v4"] }
