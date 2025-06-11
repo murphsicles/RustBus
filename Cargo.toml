@@ -15,3 +15,6 @@ dashmap = "6.0"
 regex = "1.10"
 zmq = "0.10"
 backoff = { version = "0.4", features = ["tokio"] }
+prometheus = { version = "0.13", features = ["process"] }
+dotenvy = "0.15"
+lazy_static = "1.5"
