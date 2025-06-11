@@ -1,6 +1,14 @@
-debug/
+# Rust artifacts
 target/
-.env
+debug/
 **/*.rs.bk
+
+# Environment files
+.env
+
+# Logs
+*.log
+
+# Generic
 *.pdb
 **/mutants.out*/
