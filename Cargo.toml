@@ -14,3 +14,4 @@ uuid = { version = "1.10", features = ["v4"] }
 dashmap = "6.0"
 regex = "1.10"
 zmq = "0.10"
+backoff = { version = "0.4", features = ["tokio"] }
