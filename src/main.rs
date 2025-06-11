@@ -5,19 +5,21 @@ use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Postgres, postgres::PgPoolOptions};
 use sv::{block::Block, network::Network, node::Node, transaction::Transaction};
 use tokio::sync::mpsc;
-use log::{info, error};
+use log::{info, error, warn};
 use rayon::prelude::*;
 use std::sync::Arc;
+use std::time::Duration;
 
 // Configuration struct for database and node connection
 #[derive(Clone)]
 struct Config {
     db_url: String,
     bsv_node: String,
+    network: Network,
 }
 
 // Transaction data stored in the database
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct IndexedTx {
     txid: String,
     block_height: i64,
@@ -46,10 +48,8 @@ impl actix::Actor for Subscriber {
 
 impl ws::Websocket for Subscriber {
     fn on_message(&mut self, msg: String, ctx: &mut Self::Context) {
-        // Parse subscription request
         if let Ok(sub) = serde_json::from_str::<Subscription>(&msg) {
             info!("New subscription: {:?}", sub);
-            // In a real implementation, store subscription in a shared state
         }
     }
 
@@ -69,17 +69,17 @@ struct BlockFetcher {
 }
 
 impl BlockFetcher {
-    async fn new(node_addr: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        let network = Network::Mainnet; // Adjust for Testnet if needed
+    async fn new(node_addr: &str, network: Network) -> Result<Self, Box<dyn std::error::Error>> {
         let stream = TcpStream::connect(node_addr).await?;
         let node = Node::new(stream, network, None)?;
+        info!("Connected to BSV node at {}", node_addr);
         Ok(BlockFetcher { node })
     }
 
     async fn fetch_block(&mut self, height: u64) -> Result<Block, Box<dyn std::error::Error>> {
-        // Request block by height (simplified; real impl may need header sync)
         let block_hash = self.node.get_block_hash(height).await?;
         let block = self.node.get_block(&block_hash).await?;
+        info!("Fetched block {} with hash {}", height, block_hash);
         Ok(block)
     }
 }
@@ -106,15 +106,19 @@ async fn init_db(pool: &Pool<Postgres>) -> Result<(), sqlx::Error> {
 
 // Fetch and index blocks
 async fn index_blocks(config: Config, pool: Pool<Postgres>, tx_channel: mpsc::Sender<IndexedTx>) {
-    let mut fetcher = BlockFetcher::new(&config.bsv_node)
-        .await
-        .expect("Failed to connect to BSV node");
+    let mut fetcher = match BlockFetcher::new(&config.bsv_node, config.network).await {
+        Ok(fetcher) => fetcher,
+        Err(e) => {
+            error!("Failed to connect to BSV node: {}. Retrying in 30s...", e);
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            return;
+        }
+    };
     let mut current_height = 0; // Start from genesis or a checkpoint
 
     loop {
         match fetcher.fetch_block(current_height).await {
             Ok(block) => {
-                // Process transactions in parallel
                 let indexed_txs: Vec<IndexedTx> = block.transactions.par_iter().map(|tx| {
                     let tx_type = classify_transaction(tx);
                     let op_return = extract_op_return(tx);
@@ -127,7 +131,6 @@ async fn index_blocks(config: Config, pool: Pool<Postgres>, tx_channel: mpsc::Se
                     }
                 }).collect();
 
-                // Batch insert to database
                 for tx in &indexed_txs {
                     sqlx::query(
                         r#"
@@ -143,9 +146,8 @@ async fn index_blocks(config: Config, pool: Pool<Postgres>, tx_channel: mpsc::Se
                     .bind(&tx.tx_hex)
                     .execute(&pool)
                     .await
-                    .unwrap_or_else(|e| error!("Error inserting tx: {}", e));
+                    .unwrap_or_else(|e| error!("Error inserting tx {}: {}", tx.txid, e));
 
-                    // Send to subscribers
                     let _ = tx_channel.send(tx.clone()).await;
                 }
 
@@ -153,19 +155,19 @@ async fn index_blocks(config: Config, pool: Pool<Postgres>, tx_channel: mpsc::Se
                 current_height += 1;
             }
             Err(e) => {
-                error!("Error fetching block {}: {}", current_height, e);
-                tokio::time::sleep(std::time::Duration::from_secs(10)).await; // Retry delay
+                warn!("Error fetching block {}: {}. Retrying in 10s...", current_height, e);
+                tokio::time::sleep(Duration::from_secs(10)).await;
             }
         }
-        // Simulate block time (remove in production; rely on node notifications)
-        tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+        // Remove sleep in production; use node notifications (e.g., ZMQ) for new blocks
+        tokio::time::sleep(Duration::from_secs(600)).await;
     }
 }
 
 // Classify transaction type (simplified)
 fn classify_transaction(tx: &Transaction) -> String {
     if tx.outputs.iter().any(|out| out.script.is_op_return()) {
-        "RUN".to_string() // Example
+        "RUN".to_string()
     } else {
         "STANDARD".to_string()
     }
@@ -184,7 +186,7 @@ async fn ws_route(
     stream: web::Payload,
     state: web::Data<AppState>,
 ) -> Result<HttpResponse, actix_web::Error> {
-    let (tx, rx) = mpsc::channel(100);
+    let (tx, _rx) = mpsc::channel(100);
     let subscriber = Subscriber {
         id: uuid::Uuid::new_v4().to_string(),
         tx,
@@ -198,10 +200,10 @@ async fn main() -> std::io::Result<()> {
     env_logger::init();
     let config = Config {
         db_url: "postgres://user:pass@localhost/rustbus".to_string(),
-        bsv_node: "bsv-node:8333".to_string(), // Replace with actual BSV node
+        bsv_node: "127.0.0.1:18333".to_string(), // Local testnet node
+        network: Network::Testnet,
     };
 
-    // Initialize database
     let pool = PgPoolOptions::new()
         .max_connections(10)
         .connect(&config.db_url)
@@ -209,7 +211,6 @@ async fn main() -> std::io::Result<()> {
         .expect("Failed to connect to database");
     init_db(&pool).await.expect("Failed to initialize database");
 
-    // Channel for transaction broadcasting
     let (tx_channel, mut rx_channel) = mpsc::channel::<IndexedTx>(1000);
     let state = Arc::new(AppState {
         db_pool: pool.clone(),
@@ -217,19 +218,15 @@ async fn main() -> std::io::Result<()> {
         tx_channel,
     });
 
-    // Start block indexing task
     let index_config = config.clone();
     tokio::spawn(index_blocks(index_config, pool.clone(), state.tx_channel.clone()));
 
-    // Start subscription broadcaster
     tokio::spawn(async move {
         while let Some(tx) = rx_channel.recv().await {
-            // Check against subscriptions and broadcast (simplified)
             info!("Broadcasting tx: {}", tx.txid);
         }
     });
 
-    // Start HTTP server
     HttpServer::new(move || {
         App::new()
             .app_data(web::Data::new(state.clone()))
