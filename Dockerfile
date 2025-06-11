@@ -6,7 +6,7 @@ WORKDIR /usr/src/rustbus
 COPY . .
 
 # Install system dependencies for ZeroMQ
-RUN apt-get update && apt-get install -y libzmq3-dev && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y libzmq3-dev pkg-config && rm -rf /var/lib/apt/lists/*
 
 # Build the release binary
 RUN cargo build --release
