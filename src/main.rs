@@ -25,7 +25,7 @@ struct Config {
 struct IndexedTx {
     txid: String,
     block_height: i64,
-    tx_type: String, // e.g., "RUN", "MAP"
+    tx_type: String, // e.g., "RUN", "MAP", "STANDARD"
     op_return: Option<String>,
     tx_hex: String,
 }
@@ -34,8 +34,35 @@ struct IndexedTx {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct Subscription {
     client_id: String,
-    filter_type: Option<String>, // e.g., "RUN", "MAP"
-    op_return_pattern: Option<String>, // Regex pattern for OP_RETURN
+    filter_type: Option<String>,
+    op_return_pattern: Option<String>,
+}
+
+// Transaction classifier for protocol detection
+struct TransactionClassifier {
+    run_regex: Regex,
+    map_regex: Regex,
+}
+
+impl TransactionClassifier {
+    fn new() -> Self {
+        TransactionClassifier {
+            run_regex: Regex::new(r"run://").expect("Invalid RUN regex"),
+            map_regex: Regex::new(r"1PuQa7").expect("Invalid MAP regex"),
+        }
+    }
+
+    fn classify(&self, tx: &Transaction) -> String {
+        if let Some(op_return) = extract_op_return(tx) {
+            if self.run_regex.is_match(&op_return) {
+                return "RUN".to_string();
+            }
+            if self.map_regex.is_match(&op_return) {
+                return "MAP".to_string();
+            }
+        }
+        "STANDARD".to_string()
+    }
 }
 
 // WebSocket actor for client subscriptions
@@ -49,7 +76,6 @@ impl actix::Actor for Subscriber {
     type Context = ws::WebsocketContext<Self>;
 
     fn started(&mut self, ctx: &mut Self::Context) {
-        // Start receiving messages from the channel
         let tx = self.tx.clone();
         let mut rx = tx.subscribe();
         ctx.run_interval(Duration::from_millis(100), move |act, ctx| {
@@ -62,7 +88,6 @@ impl actix::Actor for Subscriber {
     }
 
     fn stopped(&mut self, _ctx: &mut Self::Context) {
-        // Remove subscription on disconnect
         self.state.subscriptions.remove(&self.id);
         info!("Subscriber {} disconnected", self.id);
     }
@@ -71,7 +96,6 @@ impl actix::Actor for Subscriber {
 impl ws::Websocket for Subscriber {
     fn on_message(&mut self, msg: String, ctx: &mut Self::Context) {
         if let Ok(sub) = serde_json::from_str::<Subscription>(&msg) {
-            // Validate and store subscription
             let valid = sub.filter_type.is_some() || sub.op_return_pattern.is_some();
             if valid {
                 self.state.subscriptions.insert(self.id.clone(), sub.clone());
@@ -146,13 +170,14 @@ async fn index_blocks(config: Config, pool: Pool<Postgres>, state: Arc<AppState>
             return;
         }
     };
+    let classifier = TransactionClassifier::new();
     let mut current_height = 0; // Start from genesis or a checkpoint
 
     loop {
         match fetcher.fetch_block(current_height).await {
             Ok(block) => {
                 let indexed_txs: Vec<IndexedTx> = block.transactions.par_iter().map(|tx| {
-                    let tx_type = classify_transaction(tx);
+                    let tx_type = classifier.classify(tx);
                     let op_return = extract_op_return(tx);
                     IndexedTx {
                         txid: tx.txid().to_string(),
@@ -163,7 +188,6 @@ async fn index_blocks(config: Config, pool: Pool<Postgres>, state: Arc<AppState>
                     }
                 }).collect();
 
-                // Batch insert to database and check subscriptions
                 for tx in &indexed_txs {
                     sqlx::query(
                         r#"
@@ -181,7 +205,6 @@ async fn index_blocks(config: Config, pool: Pool<Postgres>, state: Arc<AppState>
                     .await
                     .unwrap_or_else(|e| error!("Error inserting tx {}: {}", tx.txid, e));
 
-                    // Check subscriptions in parallel
                     state.subscriptions.iter().par_bridge().for_each(|entry| {
                         let sub = entry.value();
                         if matches_subscription(&tx, sub) {
@@ -198,8 +221,7 @@ async fn index_blocks(config: Config, pool: Pool<Postgres>, state: Arc<AppState>
                 tokio::time::sleep(Duration::from_secs(10)).await;
             }
         }
-        // Remove in production; use ZMQ or node notifications
-        tokio::time::sleep(Duration::from_secs(600)).await;
+        tokio::time::sleep(Duration::from_secs(600)).await; // Remove in production
     }
 }
 
@@ -217,15 +239,6 @@ fn matches_subscription(tx: &IndexedTx, sub: &Subscription) -> bool {
         })
     });
     type_match && op_return_match
-}
-
-// Classify transaction type (simplified)
-fn classify_transaction(tx: &Transaction) -> String {
-    if tx.outputs.iter().any(|out| out.script.is_op_return()) {
-        "RUN".to_string()
-    } else {
-        "STANDARD".to_string()
-    }
 }
 
 // Extract OP_RETURN data
