@@ -9,6 +9,7 @@ use log::{info, error, warn};
 use rayon::prelude::*;
 use dashmap::DashMap;
 use regex::Regex;
+use zmq::Context;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,6 +18,7 @@ use std::time::Duration;
 struct Config {
     db_url: String,
     bsv_node: String,
+    zmq_addr: String,
     network: Network,
 }
 
@@ -25,7 +27,7 @@ struct Config {
 struct IndexedTx {
     txid: String,
     block_height: i64,
-    tx_type: String, // e.g., "RUN", "MAP", "STANDARD"
+    tx_type: String, // e.g., "RUN", "MAP", "B", "BCAT", "AIP", "METANET", "STANDARD"
     op_return: Option<String>,
     tx_hex: String,
 }
@@ -40,25 +42,28 @@ struct Subscription {
 
 // Transaction classifier for protocol detection
 struct TransactionClassifier {
-    run_regex: Regex,
-    map_regex: Regex,
+    protocols: Vec<(String, Regex)>,
 }
 
 impl TransactionClassifier {
     fn new() -> Self {
-        TransactionClassifier {
-            run_regex: Regex::new(r"run://").expect("Invalid RUN regex"),
-            map_regex: Regex::new(r"1PuQa7").expect("Invalid MAP regex"),
-        }
+        let protocols = vec![
+            ("RUN".to_string(), Regex::new(r"run://").expect("Invalid RUN regex")),
+            ("MAP".to_string(), Regex::new(r"1PuQa7").expect("Invalid MAP regex")),
+            ("B".to_string(), Regex::new(r"19HxigV4QyBv3tHpQVcUEQyq1pzZVdoAut").expect("Invalid B regex")),
+            ("BCAT".to_string(), Regex::new(r"15PciHG22SNLQJXMoSUaWVi7WSqc7hCfva").expect("Invalid BCAT regex")),
+            ("AIP".to_string(), Regex::new(r"1J7Gm3UGv5R3vRjAf9nV7oJ3yF3nD4r93r").expect("Invalid AIP regex")),
+            ("METANET".to_string(), Regex::new(r"1Meta").expect("Invalid Metanet regex")),
+        ];
+        TransactionClassifier { protocols }
     }
 
     fn classify(&self, tx: &Transaction) -> String {
         if let Some(op_return) = extract_op_return(tx) {
-            if self.run_regex.is_match(&op_return) {
-                return "RUN".to_string();
-            }
-            if self.map_regex.is_match(&op_return) {
-                return "MAP".to_string();
+            for (protocol, regex) in &self.protocols {
+                if regex.is_match(&op_return) {
+                    return protocol.clone();
+                }
             }
         }
         "STANDARD".to_string()
@@ -132,10 +137,9 @@ impl BlockFetcher {
         Ok(BlockFetcher { node })
     }
 
-    async fn fetch_block(&mut self, height: u64) -> Result<Block, Box<dyn std::error::Error>> {
-        let block_hash = self.node.get_block_hash(height).await?;
+    async fn fetch_block(&mut self, block_hash: &str) -> Result<Block, Box<dyn std::error::Error>> {
         let block = self.node.get_block(&block_hash).await?;
-        info!("Fetched block {} with hash {}", height, block_hash);
+        info!("Fetched block {} with hash {}", block.height, block_hash);
         Ok(block)
     }
 }
@@ -160,7 +164,7 @@ async fn init_db(pool: &Pool<Postgres>) -> Result<(), sqlx::Error> {
     Ok(())
 }
 
-// Fetch and index blocks
+// Fetch and index blocks using ZMQ
 async fn index_blocks(config: Config, pool: Pool<Postgres>, state: Arc<AppState>) {
     let mut fetcher = match BlockFetcher::new(&config.bsv_node, config.network).await {
         Ok(fetcher) => fetcher,
@@ -171,57 +175,80 @@ async fn index_blocks(config: Config, pool: Pool<Postgres>, state: Arc<AppState>
         }
     };
     let classifier = TransactionClassifier::new();
-    let mut current_height = 0; // Start from genesis or a checkpoint
+
+    // Set up ZMQ subscriber
+    let zmq_context = Context::new();
+    let subscriber = zmq_context.socket(zmq::SUB).expect("Failed to create ZMQ socket");
+    subscriber
+        .connect(&config.zmq_addr)
+        .expect("Failed to connect to ZMQ");
+    subscriber
+        .set_subscribe(b"hashblock")
+        .expect("Failed to subscribe to hashblock");
+
+    info!("Listening for ZMQ block notifications at {}", config.zmq_addr);
 
     loop {
-        match fetcher.fetch_block(current_height).await {
-            Ok(block) => {
-                let indexed_txs: Vec<IndexedTx> = block.transactions.par_iter().map(|tx| {
-                    let tx_type = classifier.classify(tx);
-                    let op_return = extract_op_return(tx);
-                    IndexedTx {
-                        txid: tx.txid().to_string(),
-                        block_height: block.height as i64,
-                        tx_type,
-                        op_return,
-                        tx_hex: tx.to_hex(),
-                    }
-                }).collect();
+        match subscriber.recv_multipart(0) {
+            Ok(parts) => {
+                if parts.len() >= 2 && parts[0] == b"hashblock" {
+                    let block_hash = hex::encode(&parts[1]);
+                    match fetcher.fetch_block(&block_hash).await {
+                        Ok(block) => {
+                            let indexed_txs: Vec<IndexedTx> = block.transactions.par_iter().map(|tx| {
+                                let tx_type = classifier.classify(tx);
+                                let op_return = extract_op_return(tx);
+                                IndexedTx {
+                                    txid: tx.txid().to_string(),
+                                    block_height: block.height as i64,
+                                    tx_type,
+                                    op_return,
+                                    tx_hex: tx.to_hex(),
+                                }
+                            }).collect();
 
-                for tx in &indexed_txs {
-                    sqlx::query(
-                        r#"
-                        INSERT INTO transactions (txid, block_height, tx_type, op_return, tx_hex)
-                        VALUES ($1, $2, $3, $4, $5)
-                        ON CONFLICT (txid) DO NOTHING
-                        "#
-                    )
-                    .bind(&tx.txid)
-                    .bind(tx.block_height)
-                    .bind(&tx.tx_type)
-                    .bind(&tx.op_return)
-                    .bind(&tx.tx_hex)
-                    .execute(&pool)
-                    .await
-                    .unwrap_or_else(|e| error!("Error inserting tx {}: {}", tx.txid, e));
+                            for tx in &indexed_txs {
+                                sqlx::query(
+                                    r#"
+                                    INSERT INTO transactions (txid, block_height, tx_type, op_return, tx_hex)
+                                    VALUES ($1, $2, $3, $4, $5)
+                                    ON CONFLICT (txid) DO NOTHING
+                                    "#
+                                )
+                                .bind(&tx.txid)
+                                .bind(tx.block_height)
+                                .bind(&tx.tx_type)
+                                .bind(&tx.op_return)
+                                .bind(&tx.tx_hex)
+                                .execute(&pool)
+                                .await
+                                .unwrap_or_else(|e| error!("Error inserting tx {}: {}", tx.txid, e));
 
-                    state.subscriptions.iter().par_bridge().for_each(|entry| {
-                        let sub = entry.value();
-                        if matches_subscription(&tx, sub) {
-                            let _ = state.tx_channel.send(tx.clone()).await;
+                                state.subscriptions.iter().par_bridge().for_each(|entry| {
+                                    let sub = entry.value();
+                                    if matches_subscription(&tx, sub) {
+                                        let _ = state.tx_channel.send(tx.clone()).await;
+                                    }
+                                });
+                            }
+
+                            info!("Indexed block {} with {} transactions", block.height, indexed_txs.len());
                         }
-                    });
+                        Err(e) => {
+                            warn!("Error fetching block {}: {}. Retrying...", block_hash, e);
+                            tokio::time::sleep(Duration::from_secs(10)).await;
+                        }
+                    }
                 }
-
-                info!("Indexed block {} with {} transactions", block.height, indexed_txs.len());
-                current_height += 1;
             }
             Err(e) => {
-                warn!("Error fetching block {}: {}. Retrying in 10s...", current_height, e);
+                warn!("ZMQ error: {}. Reconnecting in 10s...", e);
                 tokio::time::sleep(Duration::from_secs(10)).await;
+                subscriber
+                    .connect(&config.zmq_addr)
+                    .expect("Failed to reconnect to ZMQ");
             }
         }
-        tokio::time::sleep(Duration::from_secs(600)).await; // Remove in production
     }
 }
 
@@ -270,6 +297,7 @@ async fn main() -> std::io::Result<()> {
     let config = Config {
         db_url: "postgres://user:pass@localhost/rustbus".to_string(),
         bsv_node: "127.0.0.1:18333".to_string(),
+        zmq_addr: "tcp://127.0.0.1:28332".to_string(),
         network: Network::Testnet,
     };
 
