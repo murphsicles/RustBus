@@ -23,3 +23,5 @@ backoff = { version = "0.4", features = ["tokio"] }
 prometheus = { version = "0.13", features = ["process"] }
 dotenvy = "0.15"
 lazy_static = "1.5"
+async-graphql = "7.0"
+async-graphql-actix-web = "7.0"
