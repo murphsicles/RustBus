@@ -34,7 +34,7 @@ jobs:
           toolchain: stable
           components: clippy
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y libpq-dev
+        run: sudo apt-get update && sudo apt-get install -y libpq-dev libzmq3-dev
       - name: Cache Rust dependencies
         uses: actions/cache@v4
         with:
@@ -46,6 +46,10 @@ jobs:
             target/
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
+      - name: Apply database schema
+        run: psql -h localhost -U user -d rustbus -f schema.sql
+        env:
+          PGPASSWORD: pass
       - name: Run clippy
         run: cargo clippy --all-targets --all-features # Relaxed -D warnings
       - name: Run tests
