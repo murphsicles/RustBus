@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use bitcoinsv::{Transaction, Script, TxOut}; // Adjust based on actual API
+    use rust_sv::{Transaction, Script, TxOut}; // Adjust based on actual API
     use crate::TransactionClassifier;
 
     #[test]
