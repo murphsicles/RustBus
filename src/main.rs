@@ -321,7 +321,7 @@ async fn handle_reorg(
             let mut current_height = new_block.height;
             let mut current_hash = new_block.hash.clone();
             while current_height >= prev.height {
-                let block = fetcher.fetch_block(¤t_hash).await?;
+                let block = fetcher.fetch_block(t_hash).await?;
                 index_block(&mut tx, &block).await?;
                 current_hash = block.prev_hash.clone();
                 current_height -= 1;
