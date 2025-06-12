@@ -35,8 +35,8 @@ jobs:
           components: clippy
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y libpq-dev
-      - name: actions/checkout@v4
-      - name: actions/cache@v3
+      - name: Cache Rust dependencies
+        uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/bin/
@@ -45,8 +45,9 @@ jobs:
             ~/.cargo/git/db/
             target/
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
       - name: Run clippy
-        run: cargo clippy --all-targets --all-features # Relax -D warnings temporarily
+        run: cargo clippy --all-targets --all-features # Relaxed -D warnings
       - name: Run tests
         env:
           DATABASE_URL: postgres://user:pass@localhost:5432/rustbus
