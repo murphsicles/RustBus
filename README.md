@@ -96,6 +96,15 @@ Configure `RustBus` via `.env` or Docker `-e` flags:
 | START_HEIGHT     | Starting block height for historical sync| 800000                              |
 | METRICS_PORT     | Port for Prometheus metrics              | 8080                                |
 
+- `DATABASE_URL`: PostgreSQL connection string (e.g., `postgres://user:pass@db:5432/rustbus`)
+- `BSV_NODE`: BSV node address (e.g., `bsv-node:8333`)
+- `ZMQ_ADDR`: ZMQ address (e.g., `tcp://bsv-node:28332`)
+- `NETWORK`: `mainnet` or `testnet`
+- `START_HEIGHT`: Starting block height (default: `0`)
+- `BIND_ADDR`: HTTP bind address (default: `0.0.0.0:8080`)
+- `METRICS_PORT`: Prometheus metrics port (default: `9090`)
+- `PROTOCOLS`: Transaction protocol regexes (e.g., `RUN:run://; MAP:1PuQa7`)
+
 ## 📚 API Examples
 
 ### GraphQL Query
