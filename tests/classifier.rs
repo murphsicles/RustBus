@@ -1,8 +1,9 @@
 #[cfg(test)]
 mod tests {
-    use sv::{Transaction, Script, TxOut}; // Adjust based on actual API
-    use crate::TransactionClassifier;
-
+    use sv::messages::tx::Transaction;
+    use sv::messages::tx_out::TxOut;
+    use sv::script::Script;
+    use crate::classifier::TransactionClassifier;
     #[test]
     fn test_classify_run() {
         let classifier = TransactionClassifier::new();
