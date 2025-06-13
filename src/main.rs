@@ -17,6 +17,9 @@ use dotenvy::dotenv;
 use std::env;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+const TX_CHANNEL_SIZE: usize = 1000;
+const ZMQ_RECONNECT_DELAY: u64 = 5;
+const BLOCK_FETCH_RETRY_DELAY: u64 = 10;
 
 // Prometheus metrics
 lazy_static::lazy_static! {
@@ -537,7 +540,7 @@ async fn index_blocks(config: Config, pool: Pool<Postgres>, state: Arc<AppState>
                         warn!("Failed to commit DB transaction: {}. Retrying block {}", e, block_hash);
                         continue;
                     }
-
+                    
                     let elapsed = start_time.elapsed();
                     BLOCK_PROCESS_TIME.observe(elapsed.as_secs_f64());
                     info!(
@@ -549,7 +552,9 @@ async fn index_blocks(config: Config, pool: Pool<Postgres>, state: Arc<AppState>
                 }
                 Err(e) => {
                     warn!("Error fetching block {}: {}. Retrying...", block_hash, e);
-                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    tokio::time::sleep(Duration::from_secs(ZMQ_RECONNECT_DELAY)).await;
+                    // In block fetch error
+                    tokio::time::sleep(Duration::from_secs(BLOCK_FETCH_RETRY_DELAY)).await;
                 }
             }
         }
@@ -573,7 +578,8 @@ fn matches_subscription(tx: &IndexedTx, sub: &Subscription) -> bool {
     });
     type_match && op_return_match
 }
-
+// Update channel
+let (tx_channel, mut rx_channel) = mpsc::channel::<IndexedTx>(TX_CHANNEL_SIZE);
 // Extract OP_RETURN data
 fn extract_op_return(tx: &Transaction) -> Option<String> {
     tx.outputs.iter()
@@ -596,6 +602,13 @@ async fn ws_route(
     ws::start(subscriber, &req, stream)
 }
 
+// Uodate Broadcast
+tokio::spawn(async move {
+    while let Some(tx) = rx_channel.recv().await {
+        info!("Broadcasting tx: {}", tx.txid);
+    }
+    error!("Transaction channel closed unexpectedly");
+});
 // GraphQL route
 #[post("/graphql")]
 async fn graphql(
