@@ -1,7 +1,11 @@
 # RustBus: The Legendary BSV Microservices Engine
 
-![RustBus Logo](https://img.shields.io/badge/RustBus-BSV%20Explorer-blue) [![CI/CD](https://github.com/murphsicles/RustBus/actions/workflows/ci.yml/badge.svg)](https://github.com/murphsicles/RustBus/actions) [![Docker](https://img.shields.io/docker/pulls/rustbus.svg)](https://hub.docker.com/r/murphsicles/rustbus)
+## Engine
 
+[![RustBus Engine](https://img.shields.io/badge/RustBus-BSV%20Explorer-blue)](https://github.com/murphsicles/RustBus)
+[![CI/CD](https://github.com/murphsicles/RustBus/actions/workflows/ci.yml/badge.svg)](https://github.com/murphsicles/RustBus/actions)
+[![Docker](https://img.shields.io/docker/pulls/murphsicles/rustbus)](https://hub.docker.com/r/murphsicles/rustbus)
+[![Dependencies](https://deps.rs/repo/github/murphsicles/RustBus/status.svg)](https://deps.rs/repo/github/murphsicles/RustBus)
 **RustBus** is a high-performance blockchain explorer, indexer and microservices engine for the BSV blockchain (BSV), engineered to far surpass traditional indexers with exceptional scalability and efficiency. Written in Rust, `RustBus` harnesses modern technologies—GraphQL, REST, WebSocket APIs, PostgreSQL partitioning, and ZeroMQ—to provide real-time transaction and block indexing for both *mainnet* and *testnet*. Ideal for developers querying BSV transactions, miners tracking blocks, or enterprises leveraging BSV's massive blockchain, `RustBus` is your premier solution.
 
 ## ✨ Features
