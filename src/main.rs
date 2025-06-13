@@ -4,7 +4,7 @@ use async_graphql_actix_web::{GraphQLRequest, GraphQLResponse};
 use async_std::net::TcpStream;
 use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Postgres, postgres::PgPoolOptions, Transaction};
-use sv::{messages::block::Block, network::Network, node::Node, messages::Tx::Transaction};
+use sv::{messages::block::Block, network::Network, node::Node, messages::tx::Transaction};
 use tokio::sync::mpsc;
 use log::{info, error, warn};
 use rayon::prelude::*;
