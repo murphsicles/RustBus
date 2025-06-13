@@ -17,6 +17,7 @@ use dotenvy::dotenv;
 use std::env;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
 const TX_CHANNEL_SIZE: usize = 1000;
 const ZMQ_RECONNECT_DELAY: u64 = 5;
 const BLOCK_FETCH_RETRY_DELAY: u64 = 10;
@@ -37,6 +38,7 @@ struct Config {
     network: Network,
     start_height: u64,
     metrics_port: u16,
+    bind_addr: String,
 }
 
 // Transaction data
@@ -89,6 +91,7 @@ impl QueryRoot {
         limit: Option<i32>,
     ) -> async_graphql::Result<Vec<IndexedTx>> {
         let pool = ctx.data_unchecked::<Pool<Postgres>>();
+        let limit = limit.unwrap_or(100).clamp(1, 1000); // Prevent excessive queries
         let mut query_builder = sqlx::QueryBuilder::new("SELECT txid, block_height, tx_type, op_return, tx_hex FROM transactions WHERE 1=1");
         if let Some(t) = tx_type {
             query_builder.push(" AND tx_type = ");
@@ -99,7 +102,7 @@ impl QueryRoot {
             query_builder.push_bind(h);
         }
         query_builder.push(" LIMIT ");
-        query_builder.push_bind(limit.unwrap_or(100));
+        query_builder.push_bind(limit);
 
         let txs: Vec<IndexedTx> = query_builder
             .build_query_as()
@@ -127,15 +130,29 @@ struct TransactionClassifier {
 
 impl TransactionClassifier {
     fn new() -> Self {
-        let protocols = vec![
-            ("RUN".to_string(), Regex::new(r"run://").expect("Invalid RUN regex")),
-            ("MAP".to_string(), Regex::new(r"1PuQa7").expect("Invalid MAP regex")),
-            ("B".to_string(), Regex::new(r"19HxigV4QyBv3tHpQVcUEQyq1pzZVdoAut").expect("Invalid B regex")),
-            ("BCAT".to_string(), Regex::new(r"15PciHG22SNLQJXMoSUaWVi7WSqc7hCfva").expect("Invalid BCAT regex")),
-            ("AIP".to_string(), Regex::new(r"1J7Gm3UGv5R3vRjAf9nV7oJ3yF3nD4r93r").expect("Invalid AIP regex")),
-            ("METANET".to_string(), Regex::new(r"1Meta").expect("Invalid Metanet regex")),
+        let protocols_str = env::var("PROTOCOLS").unwrap_or_default();
+        let protocols = protocols_str
+            .split(';')
+            .filter_map(|p| {
+                let parts: Vec<&str> = p.split(':').collect();
+                if parts.len() == 2 {
+                    Regex::new(parts[1]).ok().map(|re| (parts[0].to_string(), re))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        let defaults = vec![
+            ("RUN".to_string(), Regex::new(r"run://").unwrap()),
+            ("MAP".to_string(), Regex::new(r"1PuQa7").unwrap()),
+            ("B".to_string(), Regex::new(r"19HxigV4QyBv3tHpQVcUEQyq1pzZVdoAut").unwrap()),
+            ("BCAT".to_string(), Regex::new(r"15PciHG22SNLQJXMoSUaWVi7WSqc7hCfva").unwrap()),
+            ("AIP".to_string(), Regex::new(r"1J7Gm3UGv5R3vRjAf9nV7oJ3yF3nD4r93r").unwrap()),
+            ("METANET".to_string(), Regex::new(r"1Meta").unwrap()),
         ];
-        TransactionClassifier { protocols }
+        TransactionClassifier {
+            protocols: if protocols.is_empty() { defaults } else { protocols },
+        }
     }
 
     fn classify(&self, tx: &Transaction) -> String {
@@ -180,7 +197,7 @@ impl actix::Actor for Subscriber {
     }
 }
 
-impl ws::Websocket for Subscriber {
+impl actix::Websocket for Subscriber {
     fn on_message(&mut self, msg: String, ctx: &mut Self::Context) {
         match serde_json::from_str::<Subscription>(&msg) {
             Ok(sub) => {
@@ -231,7 +248,7 @@ impl BlockFetcher {
     async fn fetch_block(&mut self, block_hash: &str) -> Result<Block, Box<dyn std::error::Error>> {
         let backoff = ExponentialBackoff::default();
         let block = retry(backoff, || async {
-            self.node.get_block(&block_hash).await.map_err(|e| backoff::Error::transient(e))
+            self.node.get_block(block_hash).await.map_err(|e| backoff::Error::transient(e))
         }).await?;
         info!("Fetched block {} with hash {}", block.height, block_hash);
         Ok(block)
@@ -247,7 +264,7 @@ impl BlockFetcher {
 }
 
 // Initialize database schema
-async fn init_db(pool: &Pool<Postgres>) -> Result<(), sqlx::Error> {
+async fn init_db(pool: &Pool<Postgres>, max_height: u64) -> Result<(), sqlx::Error> {
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS transactions (
@@ -269,28 +286,23 @@ async fn init_db(pool: &Pool<Postgres>) -> Result<(), sqlx::Error> {
     .execute(pool)
     .await?;
 
-    // Create initial partitions (extend as needed for mainnet)
-    sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS transactions_0_100000 PARTITION OF transactions
-            FOR VALUES FROM (0) TO (100000);
-        CREATE TABLE IF NOT EXISTS transactions_100000_200000 PARTITION OF transactions
-            FOR VALUES FROM (100000) TO (200000);
-        CREATE TABLE IF NOT EXISTS blocks_0_100000 PARTITION OF blocks
-            FOR VALUES FROM (0) TO (100000);
-        CREATE TABLE IF NOT EXISTS blocks_100000_200000 PARTITION OF blocks
-            FOR VALUES FROM (100000) TO (200000);
-        CREATE INDEX IF NOT EXISTS idx_tx_type_0_100000 ON transactions_0_100000 (tx_type);
-        CREATE INDEX IF NOT EXISTS idx_op_return_0_100000 ON transactions_0_100000 USING gin (op_return gin_trgm_ops);
-        CREATE INDEX IF NOT EXISTS idx_block_height_0_100000 ON blocks_0_100000 (height);
-        CREATE INDEX IF NOT EXISTS idx_tx_type_100000_200000 ON transactions_100000_200000 (tx_type);
-        CREATE INDEX IF NOT EXISTS idx_op_return_100000_200000 ON transactions_100000_200000 USING gin (op_return gin_trgm_ops);
-        CREATE INDEX IF NOT EXISTS idx_block_height_100000_200000 ON blocks_100000_200000 (height);
-        "#
-    )
-    .execute(pool)
-    .await?;
-
+    let partition_size = 100_000;
+    for start in (0..=max_height).step_by(partition_size as usize) {
+        let end = start + partition_size;
+        sqlx::query(&format!(
+            r#"
+            CREATE TABLE IF NOT EXISTS transactions_{start}_{end} PARTITION OF transactions
+                FOR VALUES FROM ({start}) TO ({end});
+            CREATE TABLE IF NOT EXISTS blocks_{start}_{end} PARTITION OF blocks
+                FOR VALUES FROM ({start}) TO ({end});
+            CREATE INDEX IF NOT EXISTS idx_tx_type_{start}_{end} ON transactions_{start}_{end} (tx_type);
+            CREATE INDEX IF NOT EXISTS idx_op_return_{start}_{end} ON transactions_{start}_{end} USING gin (op_return gin_trgm_ops);
+            CREATE INDEX IF NOT EXISTS idx_block_height_{start}_{end} ON blocks_{start}_{end} (height);
+            "#
+        ))
+        .execute(pool)
+        .await?;
+    }
     Ok(())
 }
 
@@ -324,7 +336,7 @@ async fn handle_reorg(
             let mut current_height = new_block.height;
             let mut current_hash = new_block.hash.clone();
             while current_height >= prev.height {
-                let block = fetcher.fetch_block(t_hash).await?;
+                let block = fetcher.fetch_block(&current_hash).await?;
                 index_block(&mut tx, &block).await?;
                 current_hash = block.prev_hash.clone();
                 current_height -= 1;
@@ -421,23 +433,10 @@ async fn sync_historical_blocks(
 }
 
 // Fetch and index blocks using ZMQ
-async fn index_blocks(config: Config, pool: Pool<Postgres>, state: Arc<AppState>) {
-    let mut fetcher = match BlockFetcher::new(&config.bsv_node, config.network).await {
-        Ok(fetcher) => fetcher,
-        Err(e) => {
-            error!("Failed to connect to BSV node: {}. Exiting...", e);
-            return;
-        }
-    };
+async fn index_blocks(config: Config, pool: Pool<Postgres>, state: Arc<AppState>) -> Result<(), Box<dyn std::error::Error>> {
+    let mut fetcher = BlockFetcher::new(&config.bsv_node, config.network).await?;
     let classifier = TransactionClassifier::new();
-
-    let latest_height = match sync_historical_blocks(&config, &pool, &mut fetcher, &classifier, &state).await {
-        Ok(height) => height,
-        Err(e) => {
-            error!("Historical sync failed: {}. Exiting...", e);
-            return;
-        }
-    };
+    let latest_height = sync_historical_blocks(&config, &pool, &mut fetcher, &classifier, &state).await?;
 
     let zmq_context = Context::new();
     let subscriber = zmq_context.socket(zmq::SUB).expect("Failed to create ZMQ socket");
@@ -459,7 +458,7 @@ async fn index_blocks(config: Config, pool: Pool<Postgres>, state: Arc<AppState>
 
         if result.is_err() {
             error!("Failed to reconnect to ZMQ after retries. Exiting...");
-            return;
+            return Err("ZMQ connection failed".into());
         }
 
         info!("Listening for ZMQ block notifications at {}", config.zmq_addr);
@@ -475,7 +474,7 @@ async fn index_blocks(config: Config, pool: Pool<Postgres>, state: Arc<AppState>
                 Ok(tx) => tx,
                 Err(e) => {
                     warn!("Failed to start DB transaction: {}. Retrying...", e);
-                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    tokio::time::sleep(Duration::from_secs(ZMQ_RECONNECT_DELAY)).await;
                     continue;
                 }
             };
@@ -523,12 +522,22 @@ async fn index_blocks(config: Config, pool: Pool<Postgres>, state: Arc<AppState>
                         }
                         TXS_INDEXED.inc();
 
-                        state.subscriptions.iter().par_bridge().for_each(|entry| {
-                            let sub = entry.value();
-                            if matches_subscription(&tx, sub) {
-                                let _ = state.tx_channel.send(tx.clone()).await;
-                            }
-                        });
+                        // Use sequential iteration for small subscription counts
+                        if state.subscriptions.len() > 100 {
+                            state.subscriptions.iter().par_bridge().for_each(|entry| {
+                                let sub = entry.value();
+                                if matches_subscription(&tx, sub) {
+                                    let _ = state.tx_channel.send(tx.clone()).await;
+                                }
+                            });
+                        } else {
+                            state.subscriptions.iter().for_each(|entry| {
+                                let sub = entry.value();
+                                if matches_subscription(&tx, sub) {
+                                    let _ = state.tx_channel.send(tx.clone()).await;
+                                }
+                            });
+                        }
                     }
 
                     if let Err(e) = index_block(&mut db_tx, &block).await {
@@ -540,7 +549,7 @@ async fn index_blocks(config: Config, pool: Pool<Postgres>, state: Arc<AppState>
                         warn!("Failed to commit DB transaction: {}. Retrying block {}", e, block_hash);
                         continue;
                     }
-                    
+
                     let elapsed = start_time.elapsed();
                     BLOCK_PROCESS_TIME.observe(elapsed.as_secs_f64());
                     info!(
@@ -552,14 +561,13 @@ async fn index_blocks(config: Config, pool: Pool<Postgres>, state: Arc<AppState>
                 }
                 Err(e) => {
                     warn!("Error fetching block {}: {}. Retrying...", block_hash, e);
-                    tokio::time::sleep(Duration::from_secs(ZMQ_RECONNECT_DELAY)).await;
-                    // In block fetch error
                     tokio::time::sleep(Duration::from_secs(BLOCK_FETCH_RETRY_DELAY)).await;
                 }
             }
         }
 
         warn!("ZMQ connection lost. Reconnecting...");
+        tokio::time::sleep(Duration::from_secs(ZMQ_RECONNECT_DELAY)).await;
     }
 }
 
@@ -578,8 +586,7 @@ fn matches_subscription(tx: &IndexedTx, sub: &Subscription) -> bool {
     });
     type_match && op_return_match
 }
-// Update channel
-let (tx_channel, mut rx_channel) = mpsc::channel::<IndexedTx>(TX_CHANNEL_SIZE);
+
 // Extract OP_RETURN data
 fn extract_op_return(tx: &Transaction) -> Option<String> {
     tx.outputs.iter()
@@ -602,13 +609,6 @@ async fn ws_route(
     ws::start(subscriber, &req, stream)
 }
 
-// Uodate Broadcast
-tokio::spawn(async move {
-    while let Some(tx) = rx_channel.recv().await {
-        info!("Broadcasting tx: {}", tx.txid);
-    }
-    error!("Transaction channel closed unexpectedly");
-});
 // GraphQL route
 #[post("/graphql")]
 async fn graphql(
@@ -657,7 +657,7 @@ async fn list_txs(
 ) -> Result<HttpResponse, actix_web::Error> {
     let tx_type = query.get("type");
     let height = query.get("height").and_then(|h| h.parse::<i64>().ok());
-    let limit = query.get("limit").and_then(|l| l.parse::<i64>().ok()).unwrap_or(100);
+    let limit = query.get("limit").and_then(|l| l.parse::<i64>().ok()).unwrap_or(100).clamp(1, 1000);
 
     let mut query_builder = sqlx::QueryBuilder::new("SELECT txid, block_height, tx_type, op_return, tx_hex FROM transactions WHERE 1=1");
     if let Some(t) = tx_type {
@@ -704,16 +704,21 @@ async fn main() -> std::io::Result<()> {
         },
         start_height: env::var("START_HEIGHT").unwrap_or("0".to_string()).parse().unwrap_or(0),
         metrics_port: env::var("METRICS_PORT").unwrap_or("9090".to_string()).parse().unwrap_or(9090),
+        bind_addr: env::var("BIND_ADDR").unwrap_or("0.0.0.0:8080".to_string()),
     };
+
+    if config.db_url.is_empty() {
+        panic!("DATABASE_URL cannot be empty");
+    }
 
     let pool = PgPoolOptions::new()
         .max_connections(10)
         .connect(&config.db_url)
         .await
         .expect("Failed to connect to database");
-    init_db(&pool).await.expect("Failed to initialize database");
+    init_db(&pool, config.start_height + 1_000_000).await.expect("Failed to initialize database");
 
-    let (tx_channel, mut rx_channel) = mpsc::channel::<IndexedTx>(1000);
+    let (tx_channel, mut rx_channel) = mpsc::channel::<IndexedTx>(TX_CHANNEL_SIZE);
     let schema = Schema::build(QueryRoot, EmptyMutation, EmptySubscription)
         .data(pool.clone())
         .finish();
@@ -725,25 +730,31 @@ async fn main() -> std::io::Result<()> {
     });
 
     let index_config = config.clone();
-    tokio::spawn(index_blocks(index_config, pool.clone(), state.clone()));
+    tokio::spawn(async move {
+        if let Err(e) = index_blocks(index_config, pool.clone(), state.clone()).await {
+            error!("Index blocks task failed: {}", e);
+        }
+    });
 
     tokio::spawn(async move {
         while let Some(tx) = rx_channel.recv().await {
             info!("Broadcasting tx: {}", tx.txid);
         }
+        error!("Transaction channel closed unexpectedly");
     });
 
     let metrics_config = config.clone();
     tokio::spawn(async move {
-        HttpServer::new(|| {
+        if let Err(e) = HttpServer::new(|| {
             App::new()
                 .route("/metrics", web::get().to(metrics))
         })
         .bind(("0.0.0.0", metrics_config.metrics_port))
-        .expect("Failed to bind metrics server")
-        .run()
+        .and_then(|server| server.run())
         .await
-        .expect("Metrics server failed");
+        {
+            error!("Metrics server failed: {}", e);
+        }
     });
 
     HttpServer::new(move || {
@@ -754,7 +765,7 @@ async fn main() -> std::io::Result<()> {
             .service(list_txs)
             .service(web::resource("/graphql").route(web::post().to(graphql)).route(web::get().to(graphiql)))
     })
-    .bind("127.0.0.1:8080")?
+    .bind(&config.bind_addr)?
     .run()
     .await
 }
