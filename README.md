@@ -235,7 +235,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 ## 📋 Planned Features
 - Lite mode for minimal transaction data (tx hash, block height).
 - Advanced filtering for RUN, MAP sub-contexts, with discovery API.
-- Explicit mempool transaction support in GraphQL. 
+- Explicit mempool transaction support in GraphQL.
 
 ## 🤝 Contributing
 
