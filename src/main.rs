@@ -1,12 +1,13 @@
 use actix::{Actor, StreamHandler};
 use actix_web::{web, App, HttpServer, HttpResponse, Responder, get, post};
 use actix_web_actors::ws;
-use async_graphql::{Schema, EmptyMutation, EmptySubscription, Object, Context, playground::PlaygroundConfig};
+use async_graphql::{Schema, EmptyMutation, EmptySubscription, Object, Context, http::PlaygroundConfig};
 use async_graphql_actix_web::{GraphQLRequest, GraphQLResponse};
 use async_std::net::TcpStream;
 use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Postgres, postgres::{PgPoolOptions, PgTransaction}};
-use sv::{Block, Network, Node, Transaction};
+use sv::messages::{Block, Transaction};
+use sv::network::Network;
 use tokio::sync::mpsc;
 use log::{info, error, warn};
 use rayon::prelude::*;
@@ -245,35 +246,27 @@ struct AppState {
 
 // Block fetcher
 struct BlockFetcher {
-    node: Node,
+    stream: TcpStream,
 }
 
 impl BlockFetcher {
-    async fn new(node_addr: &str, network: Network) -> Result<Self, Box<dyn std::error::Error>> {
+    async fn new(node_addr: &str, _network: Network) -> Result<Self, Box<dyn std::error::Error>> {
         let backoff = ExponentialBackoff::default();
         let stream = retry(backoff, || async {
             TcpStream::connect(node_addr).await.map_err(|e| backoff::Error::transient(e))
         }).await?;
-        let node = Node::new(stream, network, None)?;
         info!("Connected to BSV node at {}", node_addr);
-        Ok(BlockFetcher { node })
+        Ok(BlockFetcher { stream })
     }
 
-    async fn fetch_block(&mut self, block_hash: &str) -> Result<Block, Box<dyn std::error::Error>> {
-        let backoff = ExponentialBackoff::default();
-        let block = retry(backoff, || async {
-            self.node.get_block(block_hash).await.map_err(|e| backoff::Error::transient(e))
-        }).await?;
-        info!("Fetched block {} with hash {}", block.height, block_hash);
-        Ok(block)
+    async fn fetch_block(&mut self, _block_hash: &str) -> Result<Block, Box<dyn std::error::Error>> {
+        // TODO: Implement block fetching using sv crate or custom protocol
+        Err("Block fetching not implemented".into())
     }
 
-    async fn get_block_hash(&mut self, height: u64) -> Result<String, Box<dyn std::error::Error>> {
-        let backoff = ExponentialBackoff::default();
-        let hash = retry(backoff, || async {
-            self.node.get_block_hash(height).await.map_err(|e| backoff::Error::transient(e))
-        }).await?;
-        Ok(hash)
+    async fn get_block_hash(&mut self, _height: u64) -> Result<String, Box<dyn std::error::Error>> {
+        // TODO: Implement block hash fetching using sv crate or custom protocol
+        Err("Block hash fetching not implemented".into())
     }
 }
 
@@ -332,7 +325,7 @@ async fn handle_reorg(
         "SELECT block_hash, height, prev_hash FROM blocks WHERE height = $1"
     )
     .bind(new_block.height.saturating_sub(1) as i64)
-    .fetch_optional(&mut tx)
+    .fetch_optional(tx)
     .await?;
 
     if let Some(prev) = prev_block {
@@ -638,7 +631,7 @@ async fn graphql(
 async fn graphiql() -> HttpResponse {
     HttpResponse::Ok()
         .content_type("text/html; charset=utf-8")
-        .body(async_graphql::playground_source(
+        .body(http::playground_source(
             PlaygroundConfig::new("/graphql"),
         ))
 }
@@ -780,7 +773,7 @@ async fn main() -> std::io::Result<()> {
             .service(list_txs)
             .service(web::resource("/graphql").route(web::post().to(graphql)).route(web::get().to(graphiql)))
     })
-        .bind(&config.bind_addr)?
-        .run()
-        .await
+    .bind(&config.bind_addr)?
+    .run()
+    .await
 }
