@@ -22,9 +22,8 @@ use std::env;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use bitcoinsv_rpc::{Client as RpcClient, RpcApi};
-use bitcoinsv_rpc::bitcoin::hash::Hash as BlockHash;
+use bitcoinsv_rpc::bitcoin::hash_types::BlockHash;
 use std::io::{Cursor, Write};
-use tokio::runtime::Runtime;
 
 const TX_CHANNEL_SIZE: usize = 1000;
 const ZMQ_RECONNECT_DELAY: u64 = 5;
@@ -368,15 +367,15 @@ async fn handle_reorg(
                 .await?;
 
             let mut current_height = new_height;
-            let mut current_hash = hex::encode(sha256d(&{
+            let mut current_hash = hex::encode(&sha256d(&{
                 let mut bytes = Vec::new();
                 new_block.header.write(&mut bytes)?;
                 bytes
-            }));
+            }).0);
             while current_height >= prev.height {
                 let (block, height) = fetcher.fetch_block(&current_hash)?;
                 index_block(&mut tx, &block, height).await?;
-                current_hash = hex::encode(block.header.prev_hash.0);
+                current_hash = hex::encode(&block.header.prev_hash.0);
                 current_height -= 1;
             }
         }
@@ -392,11 +391,11 @@ async fn index_block(
     block: &Block,
     height: i64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let block_hash = hex::encode(sha256d(&{
+    let block_hash = hex::encode(&sha256d(&{
         let mut bytes = Vec::new();
         block.header.write(&mut bytes)?;
         bytes
-    }));
+    }).0);
     let prev_hash = hex::encode(block.header.prev_hash.0);
     sqlx::query(
         r#"
@@ -408,7 +407,7 @@ async fn index_block(
     .bind(&block_hash)
     .bind(height)
     .bind(&prev_hash)
-    .execute(tx)
+    .execute(&mut *tx)
     .await?;
 
     Ok(())
@@ -452,23 +451,25 @@ async fn sync_historical_blocks(
             }
         }).collect();
 
-        let mut query = sqlx::QueryBuilder::new("INSERT INTO transactions (txid, block_height, tx_type, op_return, tx_hex) VALUES ");
-        for (i, tx) in indexed_txs.iter().enumerate() {
-            if i > 0 { query.push(", "); }
-            query.push("(");
-            query.push_bind(&tx.txid);
-            query.push(", ");
-            query.push_bind(tx.block_height);
-            query.push(", ");
-            query.push_bind(&tx.tx_type);
-            query.push(", ");
-            query.push_bind(&tx.op_return);
-            query.push(", ");
-            query.push_bind(&tx.tx_hex);
-            query.push(")");
+        if !indexed_txs.is_empty() {
+            let mut query = sqlx::QueryBuilder::new("INSERT INTO transactions (txid, block_height, tx_type, op_return, tx_hex) VALUES ");
+            for (i, tx) in indexed_txs.iter().enumerate() {
+                if i > 0 { query.push(", "); }
+                query.push("(");
+                query.push_bind(&tx.txid);
+                query.push(", ");
+                query.push_bind(tx.block_height);
+                query.push(", ");
+                query.push_bind(&tx.tx_type);
+                query.push(", ");
+                query.push_bind(&tx.op_return);
+                query.push(", ");
+                query.push_bind(&tx.tx_hex);
+                query.push(")");
+            }
+            query.build().execute(&mut *db_tx).await?;
+            TXS_INDEXED.inc_by(indexed_txs.len() as f64);
         }
-        query.build().execute(&mut *db_tx).await?;
-        TXS_INDEXED.inc_by(indexed_txs.len() as f64);
 
         index_block(&mut db_tx, &block, height).await?;
         db_tx.commit().await?;
@@ -538,23 +539,25 @@ async fn index_blocks(config: Config, pool: Pool<Postgres>, state: Arc<AppState>
                         }
                     }).collect();
 
-                    let mut query = sqlx::QueryBuilder::new("INSERT INTO transactions (txid, block_height, tx_type, op_return, tx_hex) VALUES ");
-                    for (i, tx) in indexed_txs.iter().enumerate() {
-                        if i > 0 { query.push(", "); }
-                        query.push("(");
-                        query.push_bind(&tx.txid);
-                        query.push(", ");
-                        query.push_bind(tx.block_height);
-                        query.push(", ");
-                        query.push_bind(&tx.tx_type);
-                        query.push(", ");
-                        query.push_bind(&tx.op_return);
-                        query.push(", ");
-                        query.push_bind(&tx.tx_hex);
-                        query.push(")");
+                    if !indexed_txs.is_empty() {
+                        let mut query = sqlx::QueryBuilder::new("INSERT INTO transactions (txid, block_height, tx_type, op_return, tx_hex) VALUES ");
+                        for (i, tx) in indexed_txs.iter().enumerate() {
+                            if i > 0 { query.push(", "); }
+                            query.push("(");
+                            query.push_bind(&tx.txid);
+                            query.push(", ");
+                            query.push_bind(tx.block_height);
+                            query.push(", ");
+                            query.push_bind(&tx.tx_type);
+                            query.push(", ");
+                            query.push_bind(&tx.op_return);
+                            query.push(", ");
+                            query.push_bind(&tx.tx_hex);
+                            query.push(")");
+                        }
+                        query.build().execute(&mut *db_tx).await?;
+                        TXS_INDEXED.inc_by(indexed_txs.len() as f64);
                     }
-                    query.build().execute(&mut *db_tx).await?;
-                    TXS_INDEXED.inc_by(indexed_txs.len() as f64);
 
                     index_block(&mut db_tx, &block, height).await?;
                     db_tx.commit().await?;
@@ -610,10 +613,9 @@ async fn ws_route(
     stream: web::Payload,
     state: web::Data<Arc<AppState>>,
 ) -> Result<HttpResponse, actix_web::Error> {
-    let (tx, _rx) = broadcast::channel(100);
     let subscriber = Subscriber {
         id: uuid::Uuid::new_v4().to_string(),
-        tx,
+        tx: state.tx_channel.clone(),
         state: state.get_ref().clone(),
     };
     ws::start(subscriber, &req, stream)
