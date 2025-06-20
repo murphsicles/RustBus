@@ -3,11 +3,12 @@ use actix_web::{web, App, HttpServer, HttpResponse, Responder, get, post};
 use actix_web_actors::ws;
 use async_graphql::{Schema, EmptyMutation, EmptySubscription, Object, Context, http::PlaygroundConfig};
 use async_graphql_actix_web::{GraphQLRequest, GraphQLResponse};
-use async_std::net::TcpStream;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sqlx::{Pool, Postgres, postgres::{PgPoolOptions, PgTransaction}};
-use sv::messages::{Block, Transaction};
+use sv::messages::{Block, Tx};
 use sv::network::Network;
+use sv::util::{sha256d, Hash256};
 use tokio::sync::mpsc;
 use log::{info, error, warn};
 use rayon::prelude::*;
@@ -20,6 +21,8 @@ use dotenvy::dotenv;
 use std::env;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use bitcoinsv_rpc::{Client as RpcClient, RpcApi};
+use std::io::{self, Cursor, Write};
 
 const TX_CHANNEL_SIZE: usize = 1000;
 const ZMQ_RECONNECT_DELAY: u64 = 5;
@@ -39,9 +42,12 @@ struct Config {
     bsv_node: String,
     zmq_addr: String,
     network: Network,
-    start_height: u64,
+    start_height: i64,
     metrics_port: u16,
     bind_addr: String,
+    rpc_url: String,
+    rpc_user: String,
+    rpc_password: String,
 }
 
 // Transaction data
@@ -70,6 +76,15 @@ struct Subscription {
     op_return_pattern: Option<String>,
 }
 
+// Implement to_hex for Tx
+impl Tx {
+    fn to_hex(&self) -> String {
+        let mut bytes = Vec::new();
+        self.write(&mut bytes).unwrap();
+        hex::encode(bytes)
+    }
+}
+
 // GraphQL schema
 struct QueryRoot;
 
@@ -94,7 +109,7 @@ impl QueryRoot {
         limit: Option<i32>,
     ) -> async_graphql::Result<Vec<IndexedTx>> {
         let pool = ctx.data_unchecked::<Pool<Postgres>>();
-        let limit = limit.unwrap_or(100).clamp(1, 1000); // Prevent excessive queries
+        let limit = limit.unwrap_or(100).clamp(1, 1000);
         let mut query_builder = sqlx::QueryBuilder::new("SELECT txid, block_height, tx_type, op_return, tx_hex FROM transactions WHERE 1=1");
         if let Some(t) = tx_type {
             query_builder.push(" AND tx_type = ");
@@ -158,7 +173,7 @@ impl TransactionClassifier {
         }
     }
 
-    fn classify(&self, tx: &Transaction) -> String {
+    fn classify(&self, tx: &Tx) -> String {
         if let Some(op_return) = extract_op_return(tx) {
             for (protocol, regex) in &self.protocols {
                 if regex.is_match(&op_return) {
@@ -246,32 +261,34 @@ struct AppState {
 
 // Block fetcher
 struct BlockFetcher {
-    stream: TcpStream,
+    rpc: RpcClient,
 }
 
 impl BlockFetcher {
-    async fn new(node_addr: &str, _network: Network) -> Result<Self, Box<dyn std::error::Error>> {
-        let backoff = ExponentialBackoff::default();
-        let stream = retry(backoff, || async {
-            TcpStream::connect(node_addr).await.map_err(|e| backoff::Error::transient(e))
-        }).await?;
-        info!("Connected to BSV node at {}", node_addr);
-        Ok(BlockFetcher { stream })
+    async fn new(rpc_url: &str, rpc_user: &str, rpc_password: &str, _network: Network) -> Result<Self, Box<dyn std::error::Error>> {
+        let rpc = RpcClient::new(rpc_url, bitcoinsv_rpc::Auth::UserPass(rpc_user.to_string(), rpc_password.to_string()))?;
+        info!("Connected to BSV node RPC at {}", rpc_url);
+        Ok(BlockFetcher { rpc })
     }
 
-    async fn fetch_block(&mut self, _block_hash: &str) -> Result<Block, Box<dyn std::error::Error>> {
-        // TODO: Implement block fetching using sv crate or custom protocol
-        Err("Block fetching not implemented".into())
+    async fn fetch_block(&mut self, block_hash: &str) -> Result<(Block, i64), Box<dyn std::error::Error>> {
+        let block_hex = self.rpc.get_block(block_hash, 0).await?;
+        let block_bytes = hex::decode(&block_hex)?;
+        let block = Block::read(&mut Cursor::new(&block_bytes))?;
+        let block_json: Value = self.rpc.get_block(block_hash, 1).await?;
+        let height = block_json["height"].as_i64().ok_or_else(|| "Missing height")?;
+        info!("Fetched block {} with hash {}", height, block_hash);
+        Ok((block, height))
     }
 
-    async fn get_block_hash(&mut self, _height: u64) -> Result<String, Box<dyn std::error::Error>> {
-        // TODO: Implement block hash fetching using sv crate or custom protocol
-        Err("Block hash fetching not implemented".into())
+    async fn get_block_hash(&mut self, height: i64) -> Result<String, Box<dyn std::error::Error>> {
+        let hash = self.rpc.get_block_hash(height as u64).await?;
+        Ok(hash.to_string())
     }
 }
 
 // Initialize database schema
-async fn init_db(pool: &Pool<Postgres>, max_height: u64) -> Result<(), sqlx::Error> {
+async fn init_db(pool: &Pool<Postgres>, max_height: i64) -> Result<(), sqlx::Error> {
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS transactions (
@@ -318,34 +335,40 @@ async fn handle_reorg(
     pool: &Pool<Postgres>,
     fetcher: &mut BlockFetcher,
     new_block: &Block,
+    new_height: i64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut tx = pool.begin().await?;
     
     let prev_block: Option<BlockHeader> = sqlx::query_as(
         "SELECT block_hash, height, prev_hash FROM blocks WHERE height = $1"
     )
-    .bind(new_block.height.saturating_sub(1) as i64)
-    .fetch_optional(tx)
+    .bind(new_height.saturating_sub(1))
+    .fetch_optional(&mut tx)
     .await?;
 
     if let Some(prev) = prev_block {
-        if prev.block_hash != new_block.prev_hash {
-            warn!("Reorg detected at height {}. Rolling back...", new_block.height);
+        let prev_hash = hex::encode(new_block.header.prev_hash.0);
+        if prev.block_hash != prev_hash {
+            warn!("Reorg detected at height {}. Rolling back...", new_height);
             sqlx::query("DELETE FROM transactions WHERE block_height >= $1")
-                .bind(new_block.height as i64)
+                .bind(new_height)
                 .execute(&mut tx)
                 .await?;
             sqlx::query("DELETE FROM blocks WHERE height >= $1")
-                .bind(new_block.height as i64)
+                .bind(new_height)
                 .execute(&mut tx)
                 .await?;
 
-            let mut current_height = new_block.height;
-            let mut current_hash = new_block.hash.clone();
+            let mut current_height = new_height;
+            let mut current_hash = hex::encode(sha256d(&{
+                let mut bytes = Vec::new();
+                new_block.header.write(&mut bytes)?;
+                bytes
+            }));
             while current_height >= prev.height {
-                let block = fetcher.fetch_block(&current_hash).await?;
-                index_block(&mut tx, &block).await?;
-                current_hash = block.prev_hash.clone();
+                let (block, height) = fetcher.fetch_block(&current_hash).await?;
+                index_block(&mut tx, &block, height).await?;
+                current_hash = hex::encode(block.header.prev_hash.0);
                 current_height -= 1;
             }
         }
@@ -359,7 +382,14 @@ async fn handle_reorg(
 async fn index_block(
     tx: &mut PgTransaction<'_>,
     block: &Block,
+    height: i64,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let block_hash = hex::encode(sha256d(&{
+        let mut bytes = Vec::new();
+        block.header.write(&mut bytes)?;
+        bytes
+    }));
+    let prev_hash = hex::encode(block.header.prev_hash.0);
     sqlx::query(
         r#"
         INSERT INTO blocks (block_hash, height, prev_hash)
@@ -367,9 +397,9 @@ async fn index_block(
         ON CONFLICT (block_hash, height) DO NOTHING
         "#
     )
-    .bind(&block.hash)
-    .bind(block.height as i64)
-    .bind(&block.prev_hash)
+    .bind(&block_hash)
+    .bind(height)
+    .bind(&prev_hash)
     .execute(tx)
     .await?;
 
@@ -383,30 +413,33 @@ async fn sync_historical_blocks(
     fetcher: &mut BlockFetcher,
     classifier: &TransactionClassifier,
     state: &Arc<AppState>,
-) -> Result<u64, Box<dyn std::error::Error>> {
+) -> Result<i64, Box<dyn std::error::Error>> {
     let latest_height: Option<i64> = sqlx::query_scalar("SELECT MAX(height) FROM blocks")
         .fetch_one(pool)
         .await
         .unwrap_or(None);
-    let start_height = latest_height.map(|h| h as u64 + 1).unwrap_or(config.start_height);
-    let tip_height = fetcher.get_block_hash(u64::MAX).await.unwrap_or_default().parse::<u64>().unwrap_or(start_height);
+    let start_height = latest_height.map(|h| h + 1).unwrap_or(config.start_height);
+    let tip_height = match fetcher.get_block_hash(i64::MAX).await {
+        Ok(hash) => hash.parse::<i64>().unwrap_or(start_height),
+        Err(_) => start_height,
+    };
 
     for height in start_height..=tip_height {
         let block_hash = fetcher.get_block_hash(height).await?;
-        let block = fetcher.fetch_block(&block_hash).await?;
+        let (block, height) = fetcher.fetch_block(&block_hash).await?;
         let mut db_tx = pool.begin().await?;
 
-        let indexed_txs: Vec<IndexedTx> = block.transactions.par_iter().filter_map(|tx| {
-            match tx.txid() {
-                Ok(_) => Some(IndexedTx {
-                    txid: tx.txid().unwrap().to_string(),
-                    block_height: block.height as i64,
+        let indexed_txs: Vec<IndexedTx> = block.txns.par_iter().filter_map(|tx| {
+            match tx.hash() {
+                Ok(hash) => Some(IndexedTx {
+                    txid: hex::encode(hash.0),
+                    block_height: height,
                     tx_type: classifier.classify(tx),
                     op_return: extract_op_return(tx),
                     tx_hex: tx.to_hex(),
                 }),
                 Err(e) => {
-                    warn!("Invalid transaction in block {}: {}", block.height, e);
+                    warn!("Invalid transaction in block {}: {}", height, e);
                     None
                 }
             }
@@ -430,10 +463,10 @@ async fn sync_historical_blocks(
             TXS_INDEXED.inc();
         }
 
-        index_block(&mut db_tx, &block).await?;
+        index_block(&mut db_tx, &block, height).await?;
         db_tx.commit().await?;
 
-        info!("Synced historical block {} with {} transactions", block.height, indexed_txs.len());
+        info!("Synced historical block {} with {} transactions", height, indexed_txs.len());
     }
 
     Ok(tip_height)
@@ -441,7 +474,7 @@ async fn sync_historical_blocks(
 
 // Fetch and index blocks using ZMQ
 async fn index_blocks(config: Config, pool: Pool<Postgres>, state: Arc<AppState>) -> Result<(), Box<dyn std::error::Error>> {
-    let mut fetcher = BlockFetcher::new(&config.bsv_node, config.network).await?;
+    let mut fetcher = BlockFetcher::new(&config.rpc_url, &config.rpc_user, &config.rpc_password, config.network).await?;
     let classifier = TransactionClassifier::new();
     let latest_height = sync_historical_blocks(&config, &pool, &mut fetcher, &classifier, &state).await?;
 
@@ -487,23 +520,23 @@ async fn index_blocks(config: Config, pool: Pool<Postgres>, state: Arc<AppState>
             };
 
             match fetcher.fetch_block(&block_hash).await {
-                Ok(block) => {
-                    if let Err(e) = handle_reorg(&pool, &mut fetcher, &block).await {
+                Ok((block, height)) => {
+                    if let Err(e) = handle_reorg(&pool, &mut fetcher, &block, height).await {
                         warn!("Reorg handling failed: {}. Skipping block {}", e, block_hash);
                         continue;
                     }
 
-                    let indexed_txs: Vec<IndexedTx> = block.transactions.par_iter().filter_map(|tx| {
-                        match tx.txid() {
-                            Ok(_) => Some(IndexedTx {
-                                txid: tx.txid().unwrap().to_string(),
-                                block_height: block.height as i64,
+                    let indexed_txs: Vec<IndexedTx> = block.txns.par_iter().filter_map(|tx| {
+                        match tx.hash() {
+                            Ok(hash) => Some(IndexedTx {
+                                txid: hex::encode(hash.0),
+                                block_height: height,
                                 tx_type: classifier.classify(tx),
                                 op_return: extract_op_return(tx),
                                 tx_hex: tx.to_hex(),
                             }),
                             Err(e) => {
-                                warn!("Invalid transaction in block {}: {}", block.height, e);
+                                warn!("Invalid transaction in block {}: {}", height, e);
                                 None
                             }
                         }
@@ -529,26 +562,29 @@ async fn index_blocks(config: Config, pool: Pool<Postgres>, state: Arc<AppState>
                         }
                         TXS_INDEXED.inc();
 
-                        // Use sequential iteration for small subscription counts
                         if state.subscriptions.len() > 100 {
                             state.subscriptions.iter().par_bridge().for_each(|entry| {
                                 let sub = entry.value();
                                 if matches_subscription(&tx, sub) {
-                                    let _ = state.tx_channel.try_send(tx.clone());
+                                    if let Err(e) = state.tx_channel.try_send(tx.clone()) {
+                                        warn!("Failed to send tx {}: {}", tx.txid, e);
+                                    }
                                 }
                             });
                         } else {
                             state.subscriptions.iter().for_each(|entry| {
                                 let sub = entry.value();
                                 if matches_subscription(&tx, sub) {
-                                    let _ = state.tx_channel.try_send(tx.clone());
+                                    if let Err(e) = state.tx_channel.try_send(tx.clone()) {
+                                        warn!("Failed to send tx {}: {}", tx.txid, e);
+                                    }
                                 }
                             });
                         }
                     }
 
-                    if let Err(e) = index_block(&mut db_tx, &block).await {
-                        warn!("Error indexing block {}: {}. Skipping...", block.height, e);
+                    if let Err(e) = index_block(&mut db_tx, &block, height).await {
+                        warn!("Error indexing block {}: {}. Skipping...", height, e);
                         continue;
                     }
 
@@ -561,7 +597,7 @@ async fn index_blocks(config: Config, pool: Pool<Postgres>, state: Arc<AppState>
                     BLOCK_PROCESS_TIME.observe(elapsed.as_secs_f64());
                     info!(
                         "Indexed block {} with {} transactions in {:.2}s",
-                        block.height,
+                        height,
                         indexed_txs.len(),
                         elapsed.as_secs_f64()
                     );
@@ -596,7 +632,7 @@ fn matches_subscription(tx: &IndexedTx, sub: &Subscription) -> bool {
 }
 
 // Extract OP_RETURN data
-fn extract_op_return(tx: &Transaction) -> Option<String> {
+fn extract_op_return(tx: &Tx) -> Option<String> {
     tx.outputs.iter()
         .find(|out| out.script.is_op_return())
         .and_then(|out| Some(hex::encode(&out.script.data)))
@@ -665,7 +701,7 @@ async fn list_txs(
 ) -> Result<HttpResponse, actix_web::Error> {
     let tx_type = query.get("type");
     let height = query.get("height").and_then(|h| h.parse::<i64>().ok());
-    let limit = query.get("limit").and_then(|l| l.parse::<i64>().ok()).unwrap_or(100).clamp(1, 1000);
+    let limit = query.get("limit").and_then(|l| l.parse::<i32>().ok()).unwrap_or(100).clamp(1, 1000);
 
     let mut query_builder = sqlx::QueryBuilder::new("SELECT txid, block_height, tx_type, op_return, tx_hex FROM transactions WHERE 1=1");
     if let Some(t) = tx_type {
@@ -713,10 +749,13 @@ async fn main() -> std::io::Result<()> {
         start_height: env::var("START_HEIGHT").unwrap_or("0".to_string()).parse().unwrap_or(0),
         metrics_port: env::var("METRICS_PORT").unwrap_or("9090".to_string()).parse().unwrap_or(9090),
         bind_addr: env::var("BIND_ADDR").unwrap_or("0.0.0.0:8080".to_string()),
+        rpc_url: env::var("BSV_RPC_URL").unwrap_or("http://127.0.0.1:8332".to_string()),
+        rpc_user: env::var("BSV_RPC_USER").unwrap_or_default(),
+        rpc_password: env::var("BSV_RPC_PASSWORD").unwrap_or_default(),
     };
 
-    if config.db_url.is_empty() {
-        panic!("DATABASE_URL cannot be empty");
+    if config.db_url.is_empty() || config.rpc_url.is_empty() || config.rpc_user.is_empty() || config.rpc_password.is_empty() {
+        panic!("DATABASE_URL, BSV_RPC_URL, BSV_RPC_USER, and BSV_RPC_PASSWORD must be set");
     }
 
     let pool = PgPoolOptions::new()
