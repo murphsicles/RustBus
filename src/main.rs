@@ -22,7 +22,7 @@ use std::env;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use bitcoinsv_rpc::{Client as RpcClient, RpcApi};
-use bitcoinsv_rpc::bitcoin::hash_types::BlockHash;
+use bitcoinsv_rpc::BlockHash;
 use std::io::{Cursor, Write};
 
 const TX_CHANNEL_SIZE: usize = 1000;
@@ -220,10 +220,10 @@ impl Actor for Subscriber {
     }
 }
 
-impl StreamHandler<ws::Message> for Subscriber {
-    fn handle(&mut self, msg: ws::Message, ctx: &mut Self::Context) {
+impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for Subscriber {
+    fn handle(&mut self, msg: Result<ws::Message, ws::ProtocolError>, ctx: &mut Self::Context) {
         match msg {
-            ws::Message::Text(text) => {
+            Ok(ws::Message::Text(text)) => {
                 match serde_json::from_str::<Subscription>(&text) {
                     Ok(sub) => {
                         let valid = sub.filter_type.is_some() || sub.op_return_pattern.is_some();
@@ -242,16 +242,20 @@ impl StreamHandler<ws::Message> for Subscriber {
                     }
                 }
             }
-            ws::Message::Binary(bin) => {
+            Ok(ws::Message::Binary(bin)) => {
                 info!("Received binary message from {}: {} bytes", self.id, bin.len());
             }
-            ws::Message::Close(reason) => {
+            Ok(ws::Message::Close(reason)) => {
                 info!("WebSocket closed for {}: {:?}", self.id, reason);
                 ctx.close(reason);
             }
-            ws::Message::Ping(msg) => ctx.pong(&msg),
-            ws::Message::Pong(_) => {}
-            ws::Message::Nop => {}
+            Ok(ws::Message::Ping(msg)) => ctx.pong(&msg),
+            Ok(ws::Message::Pong(_)) => {}
+            Ok(ws::Message::Nop) => {}
+            Err(e) => {
+                warn!("WebSocket protocol error: {:?}", e);
+                ctx.close(None);
+            }
         }
     }
 }
@@ -354,7 +358,7 @@ async fn handle_reorg(
     .await?;
 
     if let Some(prev) = prev_block {
-        let prev_hash = hex::encode(new_block.header.prev_hash.0);
+        let prev_hash = hex::encode(&new_block.header.prev_hash.0);
         if prev.block_hash != prev_hash {
             warn!("Reorg detected at height {}. Rolling back...", new_height);
             sqlx::query("DELETE FROM transactions WHERE block_height >= $1")
@@ -396,7 +400,7 @@ async fn index_block(
         block.header.write(&mut bytes)?;
         bytes
     }).0);
-    let prev_hash = hex::encode(block.header.prev_hash.0);
+    let prev_hash = hex::encode(&block.header.prev_hash.0);
     sqlx::query(
         r#"
         INSERT INTO blocks (block_hash, height, prev_hash)
@@ -407,7 +411,7 @@ async fn index_block(
     .bind(&block_hash)
     .bind(height)
     .bind(&prev_hash)
-    .execute(&mut *tx)
+    .execute(tx)
     .await?;
 
     Ok(())
@@ -438,7 +442,7 @@ async fn sync_historical_blocks(
         let indexed_txs: Vec<IndexedTx> = block.txns.par_iter().filter_map(|tx| {
             match tx.hash() {
                 Ok(hash) => Some(IndexedTx {
-                    txid: hex::encode(hash.0),
+                    txid: hex::encode(&hash.0),
                     block_height: height,
                     tx_type: classifier.classify(tx),
                     op_return: extract_op_return(tx),
@@ -526,7 +530,7 @@ async fn index_blocks(config: Config, pool: Pool<Postgres>, state: Arc<AppState>
                     let indexed_txs: Vec<IndexedTx> = block.txns.par_iter().filter_map(|tx| {
                         match tx.hash() {
                             Ok(hash) => Some(IndexedTx {
-                                txid: hex::encode(hash.0),
+                                txid: hex::encode(&hash.0),
                                 block_height: height,
                                 tx_type: classifier.classify(tx),
                                 op_return: extract_op_return(tx),
