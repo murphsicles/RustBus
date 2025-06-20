@@ -10,6 +10,19 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install Rust
+      run: rustup update stable && rustup default stable
+    - name: Clean Cargo Cache
+      run: cargo clean
+    - name: Build
+      run: cargo build --verbose
+    - name: Run Tests
+      run: cargo test --verbose
+      
   test:
     runs-on: ubuntu-latest
     services:
