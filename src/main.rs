@@ -5,7 +5,7 @@ use async_graphql::{Schema, EmptyMutation, EmptySubscription, Object, Context};
 use async_graphql_actix_web::{GraphQLRequest, GraphQLResponse};
 use async_std::net::TcpStream;
 use serde::{Deserialize, Serialize};
-use sqlx::{Pool, Postgres, postgres::PgPoolOptions, Transaction};
+use sqlx::{Pool, Postgres, postgres::{PgPoolOptions, PgTransaction}};
 use sv::{messages::block::Block, network::Network, node::Node, messages::tx::Transaction};
 use tokio::sync::mpsc;
 use log::{info, error, warn};
@@ -54,7 +54,7 @@ struct IndexedTx {
 }
 
 // Block header
-#[derive(Debug, Serialize, Deserialize, async_graphql::SimpleObject)]
+#[derive(Debug, Serialize, Deserialize, async_graphql::SimpleObject, sqlx::FromRow)]
 struct BlockHeader {
     block_hash: String,
     height: i64,
@@ -364,7 +364,7 @@ async fn handle_reorg(
 
 // Index a single block
 async fn index_block(
-    tx: &mut Transaction<'_, Postgres>,
+    tx: &mut PgTransaction,
     block: &Block,
 ) -> Result<(), Box<dyn std::error::Error>> {
     sqlx::query(
@@ -576,6 +576,7 @@ async fn index_blocks(config: Config, pool: Pool<Postgres>, state: Arc<AppState>
                 Err(e) => {
                     warn!("Error fetching block {}: {}. Retrying...", block_hash, e);
                     tokio::time::sleep(Duration::from_secs(BLOCK_FETCH_RETRY_DELAY)).await;
+                    continue;
                 }
             }
         }
@@ -602,7 +603,7 @@ fn matches_subscription(tx: &IndexedTx, sub: &Subscription) -> bool {
 }
 
 // Extract OP_RETURN data
-fn extract_op_return(tx: &Transaction) -> Option<String> {
+fn extract_op_return(tx: &sv::messages::tx::Transaction) -> Option<String> {
     tx.outputs.iter()
         .find(|out| out.script.is_op_return())
         .and_then(|out| Some(hex::encode(&out.script.data)))
