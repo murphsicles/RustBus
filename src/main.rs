@@ -1,18 +1,18 @@
 use actix::{Actor, StreamHandler};
 use actix_web::{web, App, HttpServer, HttpResponse, Responder, get, post};
 use actix_web_actors::ws;
-use async_graphql::{Schema, EmptyMutation, EmptySubscription, Object, Context};
+use async_graphql::{Schema, EmptyMutation, EmptySubscription, Object, Context, playground::PlaygroundConfig};
 use async_graphql_actix_web::{GraphQLRequest, GraphQLResponse};
 use async_std::net::TcpStream;
 use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Postgres, postgres::{PgPoolOptions, PgTransaction}};
-use sv::{messages::block::Block, network::Network, node::Node, messages::tx::Transaction};
+use sv::{Block, Network, Node, Transaction};
 use tokio::sync::mpsc;
 use log::{info, error, warn};
 use rayon::prelude::*;
 use dashmap::DashMap;
 use regex::Regex;
-use zmq::Context;
+use zmq::Context as ZmqContext;
 use backoff::{ExponentialBackoff, future::retry};
 use prometheus::{register_counter, register_gauge, register_histogram, Counter, Gauge, Histogram};
 use dotenvy::dotenv;
@@ -364,7 +364,7 @@ async fn handle_reorg(
 
 // Index a single block
 async fn index_block(
-    tx: &mut PgTransaction,
+    tx: &mut PgTransaction<'_>,
     block: &Block,
 ) -> Result<(), Box<dyn std::error::Error>> {
     sqlx::query(
@@ -452,7 +452,7 @@ async fn index_blocks(config: Config, pool: Pool<Postgres>, state: Arc<AppState>
     let classifier = TransactionClassifier::new();
     let latest_height = sync_historical_blocks(&config, &pool, &mut fetcher, &classifier, &state).await?;
 
-    let zmq_context = Context::new();
+    let zmq_context = ZmqContext::new();
     let subscriber = zmq_context.socket(zmq::SUB).expect("Failed to create ZMQ socket");
     let backoff = ExponentialBackoff {
         max_elapsed_time: Some(Duration::from_secs(3600)),
@@ -541,14 +541,14 @@ async fn index_blocks(config: Config, pool: Pool<Postgres>, state: Arc<AppState>
                             state.subscriptions.iter().par_bridge().for_each(|entry| {
                                 let sub = entry.value();
                                 if matches_subscription(&tx, sub) {
-                                    let _ = state.tx_channel.send(tx.clone()).await;
+                                    let _ = state.tx_channel.try_send(tx.clone());
                                 }
                             });
                         } else {
                             state.subscriptions.iter().for_each(|entry| {
                                 let sub = entry.value();
                                 if matches_subscription(&tx, sub) {
-                                    let _ = state.tx_channel.send(tx.clone()).await;
+                                    let _ = state.tx_channel.try_send(tx.clone());
                                 }
                             });
                         }
@@ -603,7 +603,7 @@ fn matches_subscription(tx: &IndexedTx, sub: &Subscription) -> bool {
 }
 
 // Extract OP_RETURN data
-fn extract_op_return(tx: &sv::messages::tx::Transaction) -> Option<String> {
+fn extract_op_return(tx: &Transaction) -> Option<String> {
     tx.outputs.iter()
         .find(|out| out.script.is_op_return())
         .and_then(|out| Some(hex::encode(&out.script.data)))
@@ -638,8 +638,8 @@ async fn graphql(
 async fn graphiql() -> HttpResponse {
     HttpResponse::Ok()
         .content_type("text/html; charset=utf-8")
-        .body(async_graphql::http::playground_source(
-            async_graphql::http::PlaygroundConfig::new("/graphql"),
+        .body(async_graphql::playground_source(
+            PlaygroundConfig::new("/graphql"),
         ))
 }
 
@@ -780,7 +780,7 @@ async fn main() -> std::io::Result<()> {
             .service(list_txs)
             .service(web::resource("/graphql").route(web::post().to(graphql)).route(web::get().to(graphiql)))
     })
-    .bind(&config.bind_addr)?
-    .run()
-    .await
+        .bind(&config.bind_addr)?
+        .run()
+        .await
 }
