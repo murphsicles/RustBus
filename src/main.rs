@@ -1,28 +1,29 @@
 use actix::{Actor, StreamHandler};
 use actix_web::{web, App, HttpServer, HttpResponse, Responder, get, post};
 use actix_web_actors::ws;
-use async_graphql::{Schema, EmptyMutation, EmptySubscription, Object, Context, http::PlaygroundConfig};
+use async_graphql::{Schema, EmptyMutation, EmptySubscription, Object, Context, playground::PlaygroundConfig};
 use async_graphql_actix_web::{GraphQLRequest, GraphQLResponse};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{Pool, Postgres, postgres::{PgPoolOptions, PgTransaction}};
 use sv::messages::{Block, Tx};
 use sv::network::Network;
-use sv::util::{sha256d, Hash256};
+use sv::util::{sha256d, Serializable};
 use tokio::sync::mpsc;
 use log::{info, error, warn};
 use rayon::prelude::*;
 use dashmap::DashMap;
 use regex::Regex;
 use zmq::Context as ZmqContext;
-use backoff::{ExponentialBackoff, future::retry};
+use backoff::{ExponentialBackoff};
 use prometheus::{register_counter, register_gauge, register_histogram, Counter, Gauge, Histogram};
 use dotenvy::dotenv;
 use std::env;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use bitcoinsv_rpc::{Client as RpcClient, RpcApi};
-use std::io::{self, Cursor, Write};
+use bitcoinsv::bitcoin::hash::Hash as BlockHash;
+use std::io::{Cursor, Write};
 
 const TX_CHANNEL_SIZE: usize = 1000;
 const ZMQ_RECONNECT_DELAY: u64 = 5;
@@ -76,8 +77,12 @@ struct Subscription {
     op_return_pattern: Option<String>,
 }
 
-// Implement to_hex for Tx
-impl Tx {
+// Extension trait for Tx
+trait TxExt {
+    fn to_hex(&self) -> String;
+}
+
+impl TxExt for Tx {
     fn to_hex(&self) -> String {
         let mut bytes = Vec::new();
         self.write(&mut bytes).unwrap();
@@ -90,18 +95,17 @@ struct QueryRoot;
 
 #[Object]
 impl QueryRoot {
-    async fn transaction(&self, ctx: &Context<'_>, txid: String) -> async_graphql::Result<Option<IndexedTx>> {
+    fn transaction(&self, ctx: &Context<'_>, txid: String) -> async_graphql::Result<Option<IndexedTx>> {
         let pool = ctx.data_unchecked::<Pool<Postgres>>();
         let tx: Option<IndexedTx> = sqlx::query_as(
             "SELECT txid, block_height, tx_type, op_return, tx_hex FROM transactions WHERE txid = $1"
         )
         .bind(&txid)
-        .fetch_optional(pool)
-        .await?;
+        .fetch_optional(pool)?;
         Ok(tx)
     }
 
-    async fn transactions(
+    fn transactions(
         &self,
         ctx: &Context<'_>,
         tx_type: Option<String>,
@@ -124,19 +128,17 @@ impl QueryRoot {
 
         let txs: Vec<IndexedTx> = query_builder
             .build_query_as()
-            .fetch_all(pool)
-            .await?;
+            .fetch_all(pool)?;
         Ok(txs)
     }
 
-    async fn block(&self, ctx: &Context<'_>, height: i64) -> async_graphql::Result<Option<BlockHeader>> {
+    fn block(&self, ctx: &Context<'_>, height: i64) -> async_graphql::Result<Option<BlockHeader>> {
         let pool = ctx.data_unchecked::<Pool<Postgres>>();
         let block: Option<BlockHeader> = sqlx::query_as(
             "SELECT block_hash, height, prev_hash FROM blocks WHERE height = $1"
         )
         .bind(height)
-        .fetch_optional(pool)
-        .await?;
+        .fetch_optional(pool)?;
         Ok(block)
     }
 }
@@ -265,30 +267,32 @@ struct BlockFetcher {
 }
 
 impl BlockFetcher {
-    async fn new(rpc_url: &str, rpc_user: &str, rpc_password: &str, _network: Network) -> Result<Self, Box<dyn std::error::Error>> {
-        let rpc = RpcClient::new(rpc_url, bitcoinsv_rpc::Auth::UserPass(rpc_user.to_string(), rpc_password.to_string()))?;
+    fn new(rpc_url: &str, rpc_user: &str, rpc_password: &str, _network: Network) -> Result<Self, Box<dyn std::error::Error>> {
+        let rpc = RpcClient::new(rpc_url, bitcoinsv_rpc::Auth::UserPass(rpc_user.to_string(), rpc_password.to_string()), None)?;
         info!("Connected to BSV node RPC at {}", rpc_url);
         Ok(BlockFetcher { rpc })
     }
 
-    async fn fetch_block(&mut self, block_hash: &str) -> Result<(Block, i64), Box<dyn std::error::Error>> {
-        let block_hex = self.rpc.get_block(block_hash, 0).await?;
-        let block_bytes = hex::decode(&block_hex)?;
+    fn fetch_block(&mut self, block_hash: &str) -> Result<(Block, i64), Box<dyn std::error::Error>> {
+        let block_hash = BlockHash::from_str(block_hash)?;
+        let block_hex: Value = self.rpc.call("getblock", &[block_hash.to_string().into(), 0.into()])?;
+        let block_hex = block_hex.as_str().ok_or_else(|| "Expected string for block hex")?;
+        let block_bytes = hex::decode(block_hex)?;
         let block = Block::read(&mut Cursor::new(&block_bytes))?;
-        let block_json: Value = self.rpc.get_block(block_hash, 1).await?;
+        let block_json: Value = self.rpc.call("getblock", &[block_hash.to_string().into(), 1.into()])?;
         let height = block_json["height"].as_i64().ok_or_else(|| "Missing height")?;
         info!("Fetched block {} with hash {}", height, block_hash);
         Ok((block, height))
     }
 
-    async fn get_block_hash(&mut self, height: i64) -> Result<String, Box<dyn std::error::Error>> {
-        let hash = self.rpc.get_block_hash(height as u64).await?;
+    fn get_block_hash(&mut self, height: i64) -> Result<String, Box<dyn std::error::Error>> {
+        let hash = self.rpc.get_block_hash(height as u64)?;
         Ok(hash.to_string())
     }
 }
 
 // Initialize database schema
-async fn init_db(pool: &Pool<Postgres>, max_height: i64) -> Result<(), sqlx::Error> {
+fn init_db(pool: &Pool<Postgres>, max_height: i64) -> Result<(), sqlx::Error> {
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS transactions (
@@ -307,8 +311,7 @@ async fn init_db(pool: &Pool<Postgres>, max_height: i64) -> Result<(), sqlx::Err
         ) PARTITION BY RANGE (height);
         "#
     )
-    .execute(pool)
-    .await?;
+    .execute(pool)?;
 
     let partition_size = 100_000;
     for start in (0..=max_height).step_by(partition_size as usize) {
@@ -324,27 +327,25 @@ async fn init_db(pool: &Pool<Postgres>, max_height: i64) -> Result<(), sqlx::Err
             CREATE INDEX IF NOT EXISTS idx_block_height_{start}_{end} ON blocks_{start}_{end} (height);
             "#
         ))
-        .execute(pool)
-        .await?;
+        .execute(pool)?;
     }
     Ok(())
 }
 
 // Handle blockchain reorganization
-async fn handle_reorg(
+fn handle_reorg(
     pool: &Pool<Postgres>,
     fetcher: &mut BlockFetcher,
     new_block: &Block,
     new_height: i64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin()?;
     
     let prev_block: Option<BlockHeader> = sqlx::query_as(
         "SELECT block_hash, height, prev_hash FROM blocks WHERE height = $1"
     )
     .bind(new_height.saturating_sub(1))
-    .fetch_optional(&mut tx)
-    .await?;
+    .fetch_optional(&mut *tx)?;
 
     if let Some(prev) = prev_block {
         let prev_hash = hex::encode(new_block.header.prev_hash.0);
@@ -352,12 +353,10 @@ async fn handle_reorg(
             warn!("Reorg detected at height {}. Rolling back...", new_height);
             sqlx::query("DELETE FROM transactions WHERE block_height >= $1")
                 .bind(new_height)
-                .execute(&mut tx)
-                .await?;
+                .execute(&mut *tx)?;
             sqlx::query("DELETE FROM blocks WHERE height >= $1")
                 .bind(new_height)
-                .execute(&mut tx)
-                .await?;
+                .execute(&mut *tx)?;
 
             let mut current_height = new_height;
             let mut current_hash = hex::encode(sha256d(&{
@@ -366,20 +365,20 @@ async fn handle_reorg(
                 bytes
             }));
             while current_height >= prev.height {
-                let (block, height) = fetcher.fetch_block(&current_hash).await?;
-                index_block(&mut tx, &block, height).await?;
+                let (block, height) = fetcher.fetch_block(¤t_hash)?;
+                index_block(&mut tx, &block, height)?;
                 current_hash = hex::encode(block.header.prev_hash.0);
                 current_height -= 1;
             }
         }
     }
 
-    tx.commit().await?;
+    tx.commit()?;
     Ok(())
 }
 
 // Index a single block
-async fn index_block(
+fn index_block(
     tx: &mut PgTransaction<'_>,
     block: &Block,
     height: i64,
@@ -400,14 +399,13 @@ async fn index_block(
     .bind(&block_hash)
     .bind(height)
     .bind(&prev_hash)
-    .execute(tx)
-    .await?;
+    .execute(tx)?;
 
     Ok(())
 }
 
 // Sync historical blocks
-async fn sync_historical_blocks(
+fn sync_historical_blocks(
     config: &Config,
     pool: &Pool<Postgres>,
     fetcher: &mut BlockFetcher,
@@ -415,19 +413,17 @@ async fn sync_historical_blocks(
     state: &Arc<AppState>,
 ) -> Result<i64, Box<dyn std::error::Error>> {
     let latest_height: Option<i64> = sqlx::query_scalar("SELECT MAX(height) FROM blocks")
-        .fetch_one(pool)
-        .await
-        .unwrap_or(None);
+        .fetch_one(pool)?;
     let start_height = latest_height.map(|h| h + 1).unwrap_or(config.start_height);
-    let tip_height = match fetcher.get_block_hash(i64::MAX).await {
+    let tip_height = match fetcher.get_block_hash(i64::MAX) {
         Ok(hash) => hash.parse::<i64>().unwrap_or(start_height),
         Err(_) => start_height,
     };
 
     for height in start_height..=tip_height {
-        let block_hash = fetcher.get_block_hash(height).await?;
-        let (block, height) = fetcher.fetch_block(&block_hash).await?;
-        let mut db_tx = pool.begin().await?;
+        let block_hash = fetcher.get_block_hash(height)?;
+        let (block, height) = fetcher.fetch_block(&block_hash)?;
+        let mut db_tx = pool.begin()?;
 
         let indexed_txs: Vec<IndexedTx> = block.txns.par_iter().filter_map(|tx| {
             match tx.hash() {
@@ -458,13 +454,12 @@ async fn sync_historical_blocks(
             .bind(&tx.tx_type)
             .bind(&tx.op_return)
             .bind(&tx.tx_hex)
-            .execute(&mut db_tx)
-            .await?;
+            .execute(&mut *db_tx)?;
             TXS_INDEXED.inc();
         }
 
-        index_block(&mut db_tx, &block, height).await?;
-        db_tx.commit().await?;
+        index_block(&mut db_tx, &block, height)?;
+        db_tx.commit()?;
 
         info!("Synced historical block {} with {} transactions", height, indexed_txs.len());
     }
@@ -473,10 +468,10 @@ async fn sync_historical_blocks(
 }
 
 // Fetch and index blocks using ZMQ
-async fn index_blocks(config: Config, pool: Pool<Postgres>, state: Arc<AppState>) -> Result<(), Box<dyn std::error::Error>> {
-    let mut fetcher = BlockFetcher::new(&config.rpc_url, &config.rpc_user, &config.rpc_password, config.network).await?;
+fn index_blocks(config: Config, pool: Pool<Postgres>, state: Arc<AppState>) -> Result<(), Box<dyn std::error::Error>> {
+    let mut fetcher = BlockFetcher::new(&config.rpc_url, &config.rpc_user, &config.rpc_password, config.network)?;
     let classifier = TransactionClassifier::new();
-    let latest_height = sync_historical_blocks(&config, &pool, &mut fetcher, &classifier, &state).await?;
+    let latest_height = sync_historical_blocks(&config, &pool, &mut fetcher, &classifier, &state)?;
 
     let zmq_context = ZmqContext::new();
     let subscriber = zmq_context.socket(zmq::SUB).expect("Failed to create ZMQ socket");
@@ -486,15 +481,11 @@ async fn index_blocks(config: Config, pool: Pool<Postgres>, state: Arc<AppState>
     };
 
     loop {
-        let result = retry(backoff.clone(), || async {
-            subscriber
-                .connect(&config.zmq_addr)
-                .map_err(|e| backoff::Error::transient(e))?;
-            subscriber
-                .set_subscribe(b"hashblock")
-                .map_err(|e| backoff::Error::transient(e))?;
+        let result = retry(backoff.clone(), || {
+            subscriber.connect(&config.zmq_addr).map_err(|e| backoff::Error::transient(e))?;
+            subscriber.set_subscribe(b"hashblock").map_err(|e| backoff::Error::transient(e))?;
             Ok(())
-        }).await;
+        });
 
         if result.is_err() {
             error!("Failed to reconnect to ZMQ after retries. Exiting...");
@@ -510,18 +501,11 @@ async fn index_blocks(config: Config, pool: Pool<Postgres>, state: Arc<AppState>
 
             let start_time = Instant::now();
             let block_hash = hex::encode(&parts[1]);
-            let mut db_tx = match pool.begin().await {
-                Ok(tx) => tx,
-                Err(e) => {
-                    warn!("Failed to start DB transaction: {}. Retrying...", e);
-                    tokio::time::sleep(Duration::from_secs(ZMQ_RECONNECT_DELAY)).await;
-                    continue;
-                }
-            };
+            let mut db_tx = pool.begin()?;
 
-            match fetcher.fetch_block(&block_hash).await {
+            match fetcher.fetch_block(&block_hash) {
                 Ok((block, height)) => {
-                    if let Err(e) = handle_reorg(&pool, &mut fetcher, &block, height).await {
+                    if let Err(e) = handle_reorg(&pool, &mut fetcher, &block, height) {
                         warn!("Reorg handling failed: {}. Skipping block {}", e, block_hash);
                         continue;
                     }
@@ -555,8 +539,7 @@ async fn index_blocks(config: Config, pool: Pool<Postgres>, state: Arc<AppState>
                         .bind(&tx.tx_type)
                         .bind(&tx.op_return)
                         .bind(&tx.tx_hex)
-                        .execute(&mut db_tx)
-                        .await {
+                        .execute(&mut *db_tx) {
                             warn!("Error inserting tx {}: {}", tx.txid, e);
                             continue;
                         }
@@ -583,12 +566,12 @@ async fn index_blocks(config: Config, pool: Pool<Postgres>, state: Arc<AppState>
                         }
                     }
 
-                    if let Err(e) = index_block(&mut db_tx, &block, height).await {
+                    if let Err(e) = index_block(&mut db_tx, &block, height) {
                         warn!("Error indexing block {}: {}. Skipping...", height, e);
                         continue;
                     }
 
-                    if let Err(e) = db_tx.commit().await {
+                    if let Err(e) = db_tx.commit() {
                         warn!("Failed to commit DB transaction: {}. Retrying block {}", e, block_hash);
                         continue;
                     }
@@ -604,14 +587,14 @@ async fn index_blocks(config: Config, pool: Pool<Postgres>, state: Arc<AppState>
                 }
                 Err(e) => {
                     warn!("Error fetching block {}: {}. Retrying...", block_hash, e);
-                    tokio::time::sleep(Duration::from_secs(BLOCK_FETCH_RETRY_DELAY)).await;
+                    std::thread::sleep(Duration::from_secs(ZMQ_RECONNECT_DELAY));
                     continue;
                 }
             }
         }
 
         warn!("ZMQ connection lost. Reconnecting...");
-        tokio::time::sleep(Duration::from_secs(ZMQ_RECONNECT_DELAY)).await;
+        std::thread::sleep(Duration::from_secs(ZMQ_RECONNECT_DELAY));
     }
 }
 
@@ -639,7 +622,7 @@ fn extract_op_return(tx: &Tx) -> Option<String> {
 }
 
 // WebSocket route
-async fn ws_route(
+fn ws_route(
     req: actix_web::HttpRequest,
     stream: web::Payload,
     state: web::Data<Arc<AppState>>,
@@ -655,26 +638,26 @@ async fn ws_route(
 
 // GraphQL route
 #[post("/graphql")]
-async fn graphql(
+fn graphql(
     state: web::Data<Arc<AppState>>,
     request: GraphQLRequest,
 ) -> GraphQLResponse {
-    state.schema.execute(request.into_inner()).await.into()
+    state.schema.execute(request.into_inner())
 }
 
 // GraphiQL playground
 #[get("/graphql")]
-async fn graphiql() -> HttpResponse {
+fn graphiql() -> HttpResponse {
     HttpResponse::Ok()
         .content_type("text/html; charset=utf-8")
-        .body(http::playground_source(
+        .body(async_graphql::playground_source(
             PlaygroundConfig::new("/graphql"),
         ))
 }
 
 // REST API: Get transaction by txid
 #[get("/tx/{txid}")]
-async fn get_tx(
+fn get_tx(
     path: web::Path<String>,
     state: web::Data<Arc<AppState>>,
 ) -> Result<HttpResponse, actix_web::Error> {
@@ -683,9 +666,7 @@ async fn get_tx(
         "SELECT txid, block_height, tx_type, op_return, tx_hex FROM transactions WHERE txid = $1"
     )
     .bind(&txid)
-    .fetch_optional(&state.db_pool)
-    .await
-    .map_err(|e| actix_web::error::ErrorInternalServerError(e))?;
+    .fetch_optional(&state.db_pool)?;
 
     match tx {
         Some(tx) => Ok(HttpResponse::Ok().json(tx)),
@@ -695,7 +676,7 @@ async fn get_tx(
 
 // REST API: List transactions by type and/or height
 #[get("/txs")]
-async fn list_txs(
+fn list_txs(
     query: web::Query<std::collections::HashMap<String, String>>,
     state: web::Data<Arc<AppState>>,
 ) -> Result<HttpResponse, actix_web::Error> {
@@ -717,15 +698,13 @@ async fn list_txs(
 
     let txs: Vec<IndexedTx> = query_builder
         .build_query_as()
-        .fetch_all(&state.db_pool)
-        .await
-        .map_err(|e| actix_web::error::ErrorInternalServerError(e))?;
+        .fetch_all(&state.db_pool)?;
 
     Ok(HttpResponse::Ok().json(txs))
 }
 
 // Metrics endpoint
-async fn metrics() -> impl Responder {
+fn metrics() -> impl Responder {
     let encoder = prometheus::TextEncoder::new();
     let metric_families = prometheus::gather();
     let encoded = encoder.encode_to_string(&metric_families).unwrap_or_default();
@@ -760,10 +739,8 @@ async fn main() -> std::io::Result<()> {
 
     let pool = PgPoolOptions::new()
         .max_connections(10)
-        .connect(&config.db_url)
-        .await
-        .expect("Failed to connect to database");
-    init_db(&pool, config.start_height + 1_000_000).await.expect("Failed to initialize database");
+        .connect(&config.db_url)?;
+    init_db(&pool, config.start_height + 1_000_000)?;
 
     let (tx_channel, mut rx_channel) = mpsc::channel::<IndexedTx>(TX_CHANNEL_SIZE);
     let schema = Schema::build(QueryRoot, EmptyMutation, EmptySubscription)
@@ -777,29 +754,27 @@ async fn main() -> std::io::Result<()> {
     });
 
     let index_config = config.clone();
-    tokio::spawn(async move {
-        if let Err(e) = index_blocks(index_config, pool.clone(), state.clone()).await {
+    std::thread::spawn(move || {
+        if let Err(e) = index_blocks(index_config, pool.clone(), state.clone()) {
             error!("Index blocks task failed: {}", e);
         }
     });
 
-    tokio::spawn(async move {
-        while let Some(tx) = rx_channel.recv().await {
+    std::thread::spawn(move || {
+        while let Some(tx) = rx_channel.recv() {
             info!("Broadcasting tx: {}", tx.txid);
         }
         error!("Transaction channel closed unexpectedly");
     });
 
     let metrics_config = config.clone();
-    tokio::spawn(async move {
+    std::thread::spawn(move || {
         if let Err(e) = HttpServer::new(|| {
             App::new()
                 .route("/metrics", web::get().to(metrics))
         })
         .bind(("0.0.0.0", metrics_config.metrics_port))
-        .and_then(|server| server.run())
-        .await
-        {
+        .and_then(|server| server.run()) {
             error!("Metrics server failed: {}", e);
         }
     });
