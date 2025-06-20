@@ -1,4 +1,6 @@
+use actix::{Actor, StreamHandler};
 use actix_web::{web, App, HttpServer, HttpResponse, Responder, get, post};
+use actix_web_actors::ws;
 use async_graphql::{Schema, EmptyMutation, EmptySubscription, Object, Context};
 use async_graphql_actix_web::{GraphQLRequest, GraphQLResponse};
 use async_std::net::TcpStream;
@@ -42,7 +44,7 @@ struct Config {
 }
 
 // Transaction data
-#[derive(Debug, Serialize, Deserialize, Clone, async_graphql::SimpleObject)]
+#[derive(Debug, Serialize, Deserialize, Clone, async_graphql::SimpleObject, sqlx::FromRow)]
 struct IndexedTx {
     txid: String,
     block_height: i64,
@@ -174,7 +176,7 @@ struct Subscriber {
     state: Arc<AppState>,
 }
 
-impl actix::Actor for Subscriber {
+impl Actor for Subscriber {
     type Context = ws::WebsocketContext<Self>;
 
     fn started(&mut self, ctx: &mut Self::Context) {
@@ -197,28 +199,40 @@ impl actix::Actor for Subscriber {
     }
 }
 
-impl actix::Websocket for Subscriber {
-    fn on_message(&mut self, msg: String, ctx: &mut Self::Context) {
-        match serde_json::from_str::<Subscription>(&msg) {
-            Ok(sub) => {
-                let valid = sub.filter_type.is_some() || sub.op_return_pattern.is_some();
-                if valid {
-                    self.state.subscriptions.insert(self.id.clone(), sub.clone());
-                    info!("New subscription for client {}: {:?}", self.id, sub);
-                    ctx.text(format!("Subscribed: {:?}", sub));
-                } else {
-                    warn!("Invalid subscription from {}: no filters specified", self.id);
-                    ctx.text("Invalid subscription: must specify filter_type or op_return_pattern");
+impl StreamHandler<ws::Message> for Subscriber {
+    fn handle(&mut self, msg: ws::Message, ctx: &mut Self::Context) {
+        match msg {
+            ws::Message::Text(text) => {
+                match serde_json::from_str::<Subscription>(&text) {
+                    Ok(sub) => {
+                        let valid = sub.filter_type.is_some() || sub.op_return_pattern.is_some();
+                        if valid {
+                            self.state.subscriptions.insert(self.id.clone(), sub.clone());
+                            info!("New subscription for client {}: {:?}", self.id, sub);
+                            ctx.text(format!("Subscribed: {:?}", sub));
+                        } else {
+                            warn!("Invalid subscription from {}: no filters specified", self.id);
+                            ctx.text("Invalid subscription: must specify filter_type or op_return_pattern");
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Invalid subscription format from {}: {}", self.id, e);
+                        ctx.text("Invalid subscription format");
+                    }
                 }
             }
-            Err(e) => {
-                warn!("Invalid subscription format from {}: {}", self.id, e);
-                ctx.text("Invalid subscription format");
+            ws::Message::Binary(bin) => {
+                info!("Received binary message from {}: {} bytes", self.id, bin.len());
             }
+            ws::Message::Close(reason) => {
+                info!("WebSocket closed for {}: {:?}", self.id, reason);
+                ctx.close(reason);
+            }
+            ws::Message::Ping(msg) => ctx.pong(&msg),
+            ws::Message::Pong(_) => {}
+            ws::Message::Nop => {}
         }
     }
-
-    fn on_binary(&mut self, _data: bytes::Bytes, _ctx: &mut Self::Context) {}
 }
 
 // Shared application state
