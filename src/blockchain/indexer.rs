@@ -89,7 +89,7 @@ pub async fn index_blocks(config: Config, pool: Pool<Postgres>, state: std::sync
                             query.push_bind(&tx.tx_hex);
                             query.push(")");
                         }
-                        query.build().execute(&mut *db_tx).await?;
+                        query.build().execute(&mut db_tx).await?;
                         TXS_INDEXED.inc_by(indexed_txs.len() as f64);
                     }
 
@@ -171,7 +171,7 @@ async fn sync_historical_blocks(
                 query.push_bind(&tx.tx_hex);
                 query.push(")");
             }
-            query.build().execute(&mut *db_tx).await?;
+            query.build().execute(&mut db_tx).await?;
             TXS_INDEXED.inc_by(indexed_txs.len() as f64);
         }
 
@@ -196,7 +196,7 @@ pub async fn handle_reorg(
         "SELECT block_hash, height, prev_hash FROM blocks WHERE height = $1"
     )
     .bind(new_height.saturating_sub(1))
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut tx)
     .await?;
 
     if let Some(prev) = prev_block {
@@ -205,11 +205,11 @@ pub async fn handle_reorg(
             warn!("Reorg detected at height {}. Rolling back...", new_height);
             sqlx::query("DELETE FROM transactions WHERE block_height >= $1")
                 .bind(new_height)
-                .execute(&mut *tx)
+                .execute(&mut tx)
                 .await?;
             sqlx::query("DELETE FROM blocks WHERE height >= $1")
                 .bind(new_height)
-                .execute(&mut *tx)
+                .execute(&mut tx)
                 .await?;
 
             let mut current_height = new_height;
