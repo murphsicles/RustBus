@@ -3,7 +3,7 @@ use super::classifier::TransactionClassifier;
 use super::super::config::Config;
 use super::super::models::{IndexedTx, BlockHeader};
 use super::super::AppState;
-use super::super::utils::{extract_op_return, TxExt};
+use crate::utils::{extract_op_return, TxExt};
 use sv::messages::Block;
 use sv::util::sha256d;
 use sqlx::{Pool, Postgres, postgres::PgTransaction};
