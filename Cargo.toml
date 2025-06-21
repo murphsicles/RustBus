@@ -12,6 +12,7 @@ async-graphql-actix-web = "7.0.17"
 async-std = "1.13.1"
 backoff = { version = "0.4.0", features = ["tokio"] }
 bitcoinsv-rpc = "1.0.3"
+bitcoinsv = "0.1.0" # Added for BlockHash
 bytes = "1.7.2"
 dashmap = "6.1.0"
 dotenvy = "0.15.7"
