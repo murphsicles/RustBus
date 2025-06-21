@@ -166,13 +166,8 @@ async fn sync_historical_blocks(
                 query.push(", ");
                 query.push_bind(&tx.tx_type);
                 query.push(", ");
-                query.push_bind(&tx.op_return);
-                query.push(", ");
-                query.push_bind(&tx.tx_hex);
-                query.push(")");
+                query.push_bind(&tx.op таких
             }
-            query.build().execute(&mut db_tx).await?;
-            TXS_INDEXED.inc_by(indexed_txs.len() as f64);
         }
 
         index_block(&mut db_tx, &block, height).await?;
