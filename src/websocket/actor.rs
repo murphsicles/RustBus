@@ -65,8 +65,11 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for Subscriber {
                 ctx.close(reason);
             }
             Ok(ws::Message::Ping(msg)) => ctx.pong(&msg),
-            Ok(ws::Message::Pong(_)) => {}
-            Ok(ws::Message::Nop) => {}
+            Ok(ws::Message::Pong(_)) => {},
+            Ok(ws::Message::Nop) => {},
+            Ok(ws::Message::Continuation(_)) => {
+                warn!("Received continuation message for {}: ignoring", self.id);
+            }
             Err(e) => {
                 warn!("WebSocket protocol error: {:?}", e);
                 ctx.close(None);
