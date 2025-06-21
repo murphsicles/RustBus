@@ -89,7 +89,7 @@ pub async fn index_blocks(config: Config, pool: Pool<Postgres>, state: std::sync
                             query.push_bind(&tx.tx_hex);
                             query.push(")");
                         }
-                        query.build().execute(&mut db_tx).await?;
+                        query.build().execute(db_tx).await?;
                         TXS_INDEXED.inc_by(indexed_txs.len() as f64);
                     }
 
@@ -171,7 +171,7 @@ async fn sync_historical_blocks(
                 query.push_bind(&tx.tx_hex);
                 query.push(")");
             }
-            query.build().execute(&mut db_tx).await?;
+            query.build().execute(db_tx).await?;
             TXS_INDEXED.inc_by(indexed_txs.len() as f64);
         }
 
@@ -238,7 +238,7 @@ async fn index_block(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let block_hash = hex::encode(&sha256d(&{
         let mut bytes = Vec::new();
-        self.write(&mut bytes)?;
+        block.header.write(&mut bytes)?;
         bytes
     }).0);
     let prev_hash = hex::encode(&block.header.prev_hash.0);
@@ -252,7 +252,7 @@ async fn index_block(
     .bind(&block_hash)
     .bind(height)
     .bind(&prev_hash)
-    .execute(&mut tx)
+    .execute(tx)
     .await?;
 
     Ok(())
