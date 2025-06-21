@@ -11,7 +11,7 @@ pub async fn ws_route(
     let subscriber = Subscriber {
         id: uuid::Uuid::new_v4().to_string(),
         tx: state.tx_channel.clone(),
-        state: state.get_ref().clone(),
+        state: state.into_inner(),
     };
     ws::start(subscriber, &req, stream)
 }
