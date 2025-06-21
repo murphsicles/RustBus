@@ -35,7 +35,7 @@ impl TransactionClassifier {
     }
 
     pub fn classify(&self, tx: &Tx) -> String {
-        if let Some(op_return) = extract_op_return(tx) {
+        if let Some(op_return: String) = extract_op_return(tx) {
             for (protocol, regex) in &self.protocols {
                 if regex.is_match(&op_return) {
                     return protocol.clone();
