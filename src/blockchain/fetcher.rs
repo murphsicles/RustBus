@@ -1,17 +1,22 @@
 use bitcoinsv_rpc::{Client as RpcClient, RpcApi};
 use bitcoinsv::bitcoin::BlockHash;
 use sv::messages::Block;
+use sv::network::Network;
 use sv::util::Serializable;
 use log::info;
-use serde_json::Value;
+use serde_json::{Value, to_value};
 use std::io::Cursor;
+
+fn into_json<T: serde::Serialize>(val: T) -> Result<Value, Box<dyn std::error::Error>> {
+    Ok(to_value(val)?)
+}
 
 pub struct BlockFetcher {
     rpc: RpcClient,
 }
 
 impl BlockFetcher {
-    pub fn new(rpc_url: &str, rpc_user: &str, rpc_password: &str, _network: super::super::config::Network) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new(rpc_url: &str, rpc_user: &str, rpc_password: &str, _network: Network) -> Result<Self, Box<dyn std::error::Error>> {
         let rpc = RpcClient::new(rpc_url, bitcoinsv_rpc::Auth::UserPass(rpc_user.to_string(), rpc_password.to_string()), None)?;
         info!("Connected to BSV node RPC at {}", rpc_url);
         Ok(BlockFetcher { rpc })
