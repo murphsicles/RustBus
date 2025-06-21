@@ -1,5 +1,5 @@
 use bitcoinsv_rpc::{Client as RpcClient, RpcApi};
-use bitcoin_hashes::Hash as BsvHash;
+use bitcoinsv::bitcoin::BlockHash;
 use sv::messages::Block;
 use sv::util::Serializable;
 use log::info;
@@ -18,12 +18,12 @@ impl BlockFetcher {
     }
 
     pub fn fetch_block(&mut self, block_hash: &str) -> Result<(Block, i64), Box<dyn std::error::Error>> {
-        let block_hash = BsvHash::from_str(block_hash)?;
-        let block_hex: Value = self.rpc.call("getblock", &[block_hash.to_string().into(), 0.into()])?;
+        let block_hash = BlockHash::from_str(block_hash)?;
+        let block_hex: Value = self.rpc.call("getblock", &[into_json(block_hash)?, 0.into()])?;
         let block_hex = block_hex.as_str().ok_or_else(|| "Expected string for block hex")?;
         let block_bytes = hex::decode(block_hex)?;
         let block = Block::read(&mut Cursor::new(&block_bytes))?;
-        let block_json: Value = self.rpc.call("getblock", &[block_hash.to_string().into(), 1.into()])?;
+        let block_json: Value = self.rpc.call("getblock", &[into_json(block_hash)?, 1.into()])?;
         let height = block_json["height"].as_i64().ok_or_else(|| "Missing height")?;
         info!("Fetched block {} with hash {}", height, block_hash);
         Ok((block, height))
