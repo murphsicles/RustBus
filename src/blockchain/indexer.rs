@@ -166,8 +166,13 @@ async fn sync_historical_blocks(
                 query.push(", ");
                 query.push_bind(&tx.tx_type);
                 query.push(", ");
-                query.push_bind(&tx.op таких
+                query.push_bind(&tx.op_return);
+                query.push(", ");
+                query.push_bind(&tx.tx_hex);
+                query.push(")");
             }
+            query.build().execute(&mut db_tx).await?;
+            TXS_INDEXED.inc_by(indexed_txs.len() as f64);
         }
 
         index_block(&mut db_tx, &block, height).await?;
@@ -233,7 +238,7 @@ async fn index_block(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let block_hash = hex::encode(&sha256d(&{
         let mut bytes = Vec::new();
-        block.header.write(&mut bytes)?;
+        self.write(&mut bytes)?;
         bytes
     }).0);
     let prev_hash = hex::encode(&block.header.prev_hash.0);
