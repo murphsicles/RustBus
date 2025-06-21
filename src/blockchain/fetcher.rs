@@ -1,4 +1,5 @@
-use bitcoinsv_rpc::{Client as RpcClient, RpcApi, BlockHash};
+use bitcoinsv_rpc::{Client as RpcClient, RpcApi};
+use bitcoin_hashes::Hash as BsvHash;
 use sv::messages::Block;
 use sv::util::Serializable;
 use log::info;
@@ -17,7 +18,7 @@ impl BlockFetcher {
     }
 
     pub fn fetch_block(&mut self, block_hash: &str) -> Result<(Block, i64), Box<dyn std::error::Error>> {
-        let block_hash = BlockHash::from_str(block_hash)?;
+        let block_hash = BsvHash::from_str(block_hash)?;
         let block_hex: Value = self.rpc.call("getblock", &[block_hash.to_string().into(), 0.into()])?;
         let block_hex = block_hex.as_str().ok_or_else(|| "Expected string for block hex")?;
         let block_bytes = hex::decode(block_hex)?;
