@@ -252,7 +252,7 @@ async fn index_block(
     .bind(&block_hash)
     .bind(height)
     .bind(&prev_hash)
-    .execute(&mut tx)
+    .execute(&mut *tx)
     .await?;
 
     Ok(())
