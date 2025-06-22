@@ -1,5 +1,5 @@
 use bitcoinsv_rpc::{Client as RpcClient, RpcApi};
-use bitcoinsv::bitcoin::{BlockHash, Hash};
+use bitcoinsv::bitcoin::BlockHash;
 use sv::messages::Block;
 use sv::network::Network;
 use sv::util::Serializable;
