@@ -4,7 +4,7 @@ use sv::util::Serializable;
 pub fn extract_op_return(tx: &Tx) -> Option<String> {
     tx.outputs.iter()
         .find(|out| out.lock_script.is_op_return())
-        .and_then(|out| Some(hex::encode(&out.lock_script.data)))
+        .and_then(|out| Some(hex::encode(&out.lock_script.0)))
 }
 
 pub trait TxExt {
