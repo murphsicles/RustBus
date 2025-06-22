@@ -27,7 +27,16 @@ jobs:
           --health-timeout 5s
           --health-retries 5
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.ref }}
+      - name: Debug commit info
+        run: |
+          echo "Commit SHA: ${{ github.sha }}"
+          git log -1 --pretty=%B
+      - name: Debug indexer.rs contents
+        run: cat src/blockchain/indexer.rs
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
@@ -35,8 +44,6 @@ jobs:
           components: clippy
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y libpq-dev libzmq3-dev
-      - name: Debug indexer.rs contents
-        run: cat src/blockchain/indexer.rs
       - name: Clean Cargo Cache
         run: cargo clean
       - name: Cache Rust dependencies
@@ -48,9 +55,9 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-cargo-v2-${{ hashFiles('**/Cargo.lock', 'src/blockchain/indexer.rs') }}
+          key: ${{ runner.os }}-cargo-v3-${{ hashFiles('**/Cargo.lock', 'src/blockchain/indexer.rs') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-v2-
+            ${{ runner.os }}-cargo-v3-
       - name: Apply database schema
         run: psql -h localhost -U user -d rustbus -f schema.sql
         env:
