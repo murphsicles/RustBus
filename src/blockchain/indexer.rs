@@ -219,7 +219,7 @@ pub async fn handle_reorg(
                 bytes
             }).0);
             while current_height >= prev.height {
-                let (block, height) = fetcher.fetch_block(&current_hash)?;
+                let (block, height) = fetcher.fetch_block(current_hash.as_str())?;
                 index_block(&mut tx, &block, height).await?;
                 current_hash = hex::encode(&block.header.prev_hash.0);
                 current_height -= 1;
