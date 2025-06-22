@@ -204,13 +204,13 @@ pub async fn handle_reorg(
         if prev.block_hash != prev_hash {
             warn!("Reorg detected at height {}. Rolling back...", new_height);
             sqlx::query("DELETE FROM transactions WHERE block_height >= $1")
-                .bind(new_height)
-                .execute(&mut tx)
-                .await?;
-            sqlx::query("DELETE FROM blocks WHERE height >= $1")
-                .bind(new_height)
-                .execute(&mut tx)
-                .await?;
+            .bind(new_height)
+            .execute(&mut tx)
+            .await?;
+            sqlx::query("DELETE FROM blocks WHERE block_height >= $1")
+            .bind(new_height)
+            .execute(&mut tx)
+            .await?;
 
             let mut current_height = new_height;
             let mut current_hash = hex::encode(&sha256d(&{
@@ -243,17 +243,17 @@ async fn index_block(
     }).0);
     let prev_hash = hex::encode(&block.header.prev_hash.0);
     sqlx::query(
-        r#"
-        INSERT INTO blocks (block_hash, height, prev_hash)
-        VALUES ($1, $2, $3)
-        ON CONFLICT (block_hash, height) DO NOTHING
-        "#
-    )
-    .bind(&block_hash)
-    .bind(height)
-    .bind(&prev_hash)
-    .execute(tx)
-    .await?;
+    r#"
+    INSERT INTO blocks (block_hash, height, prev_hash)
+    VALUES ($1, $2, $3)
+    ON CONFLICT (block_hash, height) DO NOTHING
+    "#
+)
+.bind(&block_hash)
+.bind(height)
+.bind(&prev_hash)
+.execute(tx)
+.await?;
 
     Ok(())
 }
