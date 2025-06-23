@@ -6,7 +6,7 @@ use super::super::AppState;
 use crate::utils::{extract_op_return, TxExt};
 use sv::messages::Block;
 use sv::util::{sha256d, Serializable};
-use sqlx::{Pool, Postgres, postgres::PgTransaction, Executor};
+use sqlx::{Pool, Postgres, postgres::PgTransaction};
 use log::{info, warn, error};
 use rayon::prelude::*;
 use backoff::{ExponentialBackoff, future::retry};
@@ -87,8 +87,7 @@ async fn process_new_block(
 ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
     let mut db_tx = pool.begin().await?;
     
-    let (block, height) = fetcher.fetch_block(block_hash)?;
-    
+    info!("Transaction type before handle_reorg: {:?}", std::any::type_name_of_val(&db_tx));
     db_tx = handle_reorg(&pool, fetcher, &block, height, db_tx).await?;
     let (tx_count, db_tx) = process_block_transactions(db_tx, &block, height, classifier).await?;
     db_tx = index_block(db_tx, &block, height).await?;
@@ -121,6 +120,7 @@ async fn sync_historical_blocks(
         let (block, height) = fetcher.fetch_block(&block_hash)?;
         let mut db_tx = pool.begin().await?;
 
+        info!("Transaction type before handle_reorg: {:?}", std::any::type_name_of_val(&db_tx));
         db_tx = handle_reorg(&pool, fetcher, &block, height, db_tx).await?;
         let (tx_count, db_tx) = process_block_transactions(db_tx, &block, height, classifier).await?;
         db_tx = index_block(db_tx, &block, height).await?;
@@ -282,7 +282,7 @@ async fn index_block(
 ) -> Result<PgTransaction<'_>, Box<dyn std::error::Error + Send + Sync>> {
     let mut tx = tx;
     let block_hash = hex::encode(&sha256d(&{
-        let mut bytes = Vec::new;
+        let mut bytes = Vec::new();
         block.header.write(&mut bytes)?;
         bytes
     }).0);
