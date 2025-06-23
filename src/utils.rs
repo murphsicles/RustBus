@@ -1,4 +1,4 @@
-use sv::script::{Script, Opcode};
+use sv::script::Opcode;
 use sv::messages::Tx;
 use sv::util::Serializable;
 
