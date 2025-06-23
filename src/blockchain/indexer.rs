@@ -28,7 +28,6 @@ pub async fn index_blocks(config: Config, pool: Pool<Postgres>, state: std::sync
     };
 
     loop {
-        // Create new socket for each reconnection attempt
         let subscriber = zmq_context.socket(zmq::SUB).expect("Failed to create ZMQ socket");
         
         let result: Result<(), backoff::Error<zmq::Error>> = retry(backoff.clone(), || async {
@@ -86,7 +85,6 @@ async fn process_new_block(
     
     let (block, height) = fetcher.fetch_block(block_hash)?;
     
-    // Handle potential reorganization
     if let Err(e) = handle_reorg(&pool, fetcher, &block, height).await {
         warn!("Reorg handling failed for block {}: {}. Skipping block", block_hash, e);
         if let Err(rollback_err) = db_tx.rollback().await {
@@ -96,7 +94,7 @@ async fn process_new_block(
     }
 
     let tx_count = process_block_transactions(&mut db_tx, &block, height, classifier).await?;
-    index_block(&mut db_tx, &block, height).await?;
+    let db_tx = index_block(db_tx, &block, height).await?;
 
     db_tx.commit().await.map_err(|e| {
         error!("Failed to commit transaction for block {}: {}", block_hash, e);
@@ -111,7 +109,7 @@ async fn sync_historical_blocks(
     pool: &Pool<Postgres>,
     fetcher: &mut BlockFetcher,
     classifier: &TransactionClassifier,
-    state: &std::sync::Arc<AppState>,
+    _state: &std::sync::Arc<AppState>,
 ) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
     let latest_height: Option<i64> = sqlx::query_scalar("SELECT MAX(height) FROM blocks")
         .fetch_one(pool)
@@ -127,7 +125,7 @@ async fn sync_historical_blocks(
         let mut db_tx = pool.begin().await?;
 
         let tx_count = process_block_transactions(&mut db_tx, &block, height, classifier).await?;
-        index_block(&mut db_tx, &block, height).await?;
+        let db_tx = index_block(db_tx, &block, height).await?;
 
         db_tx.commit().await.map_err(|e| {
             error!("Failed to commit transaction for historical block {}: {}", height, e);
@@ -135,9 +133,6 @@ async fn sync_historical_blocks(
         })?;
 
         info!("Synced historical block {} with {} transactions", height, tx_count);
-        
-        // Update state to show progress
-        // state.update_sync_progress(height, tip_height); // Commented out due to missing method
     }
 
     Ok(tip_height)
@@ -164,21 +159,18 @@ async fn process_block_transactions(
         return Ok(0);
     }
 
-    // Process transactions in batches to avoid memory issues
-    let mut db_tx = *db_tx; // Take ownership
     for batch in indexed_txs.chunks(BATCH_SIZE) {
-        db_tx = insert_transaction_batch(db_tx, batch).await?;
+        insert_transaction_batch(db_tx, batch).await?;
     }
-    *db_tx = db_tx; // Reassign back
 
     TXS_INDEXED.inc_by(indexed_txs.len() as f64);
     Ok(indexed_txs.len())
 }
 
 async fn insert_transaction_batch(
-    db_tx: PgTransaction<'_>,
+    db_tx: &mut PgTransaction<'_>,
     batch: &[IndexedTx],
-) -> Result<PgTransaction<'_>, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut query = sqlx::QueryBuilder::new(
         "INSERT INTO transactions (txid, block_height, tx_type, op_return, tx_hex) VALUES "
     );
@@ -202,12 +194,12 @@ async fn insert_transaction_batch(
     
     query.push(" ON CONFLICT (txid) DO NOTHING");
     
-    let db_tx = query.build().execute(db_tx).await.map_err(|e| {
+    query.build().execute(&mut *db_tx).await.map_err(|e| {
         error!("Failed to insert transaction batch of {} transactions: {}", batch.len(), e);
         e
-    })?.0;
+    })?;
     
-    Ok(db_tx)
+    Ok(())
 }
 
 pub async fn handle_reorg(
@@ -218,7 +210,6 @@ pub async fn handle_reorg(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut tx = pool.begin().await?;
     
-    // Check if we have the previous block
     let prev_block: Option<BlockHeader> = sqlx::query_as(
         "SELECT block_hash, height, prev_hash FROM blocks WHERE height = $1"
     )
@@ -233,12 +224,10 @@ pub async fn handle_reorg(
             warn!("Reorg detected at height {}. Expected prev hash: {}, got: {}", 
                   new_height, expected_prev_hash, prev.block_hash);
             
-            // Find the fork point by walking back
             let fork_height = find_fork_point(pool, fetcher, new_height).await?;
             
             warn!("Fork point found at height {}. Rolling back to height {}", fork_height, fork_height);
             
-            // Remove all blocks and transactions from fork point onwards
             sqlx::query("DELETE FROM transactions WHERE block_height > $1")
                 .bind(fork_height)
                 .execute(&mut *tx)
@@ -264,9 +253,7 @@ async fn find_fork_point(
 ) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
     let mut height = start_height - 1;
     
-    // Walk backwards to find where our chain diverges from the new chain
     while height > 0 {
-        // Get our stored block hash
         let our_hash: Option<String> = sqlx::query_scalar(
             "SELECT block_hash FROM blocks WHERE height = $1"
         )
@@ -275,11 +262,9 @@ async fn find_fork_point(
         .await?;
         
         if let Some(our_hash) = our_hash {
-            // Get the canonical block hash at this height
             let canonical_hash = fetcher.get_block_hash(height)?;
             
             if our_hash == canonical_hash {
-                // Found the fork point
                 return Ok(height);
             }
         }
@@ -287,15 +272,14 @@ async fn find_fork_point(
         height -= 1;
     }
     
-    // If we get here, the fork is very deep or at genesis
     Ok(0)
 }
 
 async fn index_block(
-    tx: &mut PgTransaction<'_>,
+    tx: PgTransaction<'_>,
     block: &Block,
     height: i64,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<PgTransaction<'_>, Box<dyn std::error::Error + Send + Sync>> {
     let block_hash = hex::encode(&sha256d(&{
         let mut bytes = Vec::new();
         block.header.write(&mut bytes)?;
@@ -304,7 +288,7 @@ async fn index_block(
     
     let prev_hash = hex::encode(&block.header.prev_hash.0);
     
-    sqlx::query(
+    let tx = sqlx::query(
         r#"
         INSERT INTO blocks (block_hash, height, prev_hash, timestamp)
         VALUES ($1, $2, $3, $4)
@@ -315,8 +299,9 @@ async fn index_block(
     .bind(height)
     .bind(&prev_hash)
     .bind(block.header.timestamp as i64)
-    .execute(&mut *tx)
-    .await?;
-
-    Ok(())
+    .execute(tx)
+    .await?
+    .0;
+    
+    Ok(tx)
 }
