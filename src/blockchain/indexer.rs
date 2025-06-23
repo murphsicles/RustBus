@@ -192,7 +192,9 @@ async fn insert_transaction_batch(
     
     query.push(" ON CONFLICT (txid) DO NOTHING");
     
-    query.build().execute(&mut *db_tx).await.map_err(|e| {
+    let db_tx: &mut sqlx::Transaction<'_, Postgres> = &mut *db_tx;
+    info!("Transaction type in insert_transaction_batch: {:?}", std::any::type_name_of_val(&db_tx));
+    query.build().execute(db_tx).await.map_err(|e| {
         error!("Failed to insert transaction batch of {} transactions: {}", batch.len(), e);
         e
     })?;
