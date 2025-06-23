@@ -31,7 +31,7 @@ pub async fn index_blocks(config: Config, pool: Pool<Postgres>, state: std::sync
         // Create new socket for each reconnection attempt
         let subscriber = zmq_context.socket(zmq::SUB).expect("Failed to create ZMQ socket");
         
-        let result = retry(backoff.clone(), || async {
+        let result: Result<(), backoff::Error<zmq::Error>> = retry(backoff.clone(), || async {
             subscriber.connect(&config.zmq_addr).map_err(|e| backoff::Error::transient(e))?;
             subscriber.set_subscribe(b"hashblock").map_err(|e| backoff::Error::transient(e))?;
             Ok(())
@@ -87,7 +87,7 @@ async fn process_new_block(
     let (block, height) = fetcher.fetch_block(block_hash)?;
     
     // Handle potential reorganization
-    if let Err(e) = handle_reorg(&pool, &mut fetcher, &block, height).await {
+    if let Err(e) = handle_reorg(&pool, fetcher, &block, height).await {
         warn!("Reorg handling failed for block {}: {}. Skipping block", block_hash, e);
         if let Err(rollback_err) = db_tx.rollback().await {
             warn!("Failed to rollback transaction: {}", rollback_err);
