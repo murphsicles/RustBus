@@ -211,7 +211,7 @@ pub async fn handle_reorg(
         "SELECT block_hash, height, prev_hash FROM blocks WHERE height = $1"
     )
     .bind(new_height - 1)
-    .fetch_optional(tx)
+    .fetch_optional(&mut *tx)
     .await?;
 
     if let Some(prev) = prev_block {
