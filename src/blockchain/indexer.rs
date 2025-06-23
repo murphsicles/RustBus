@@ -15,7 +15,7 @@ use super::super::metrics::{TXS_INDEXED, BLOCK_PROCESS_TIME};
 
 const ZMQ_RECONNECT_DELAY: u64 = 5;
 
-pub async fn index_blocks(config: Config, pool: Pool<Postgres>, state: std::sync::Arc<AppState>) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn index_blocks(config: Config, pool: Pool<Postgres>, state: std::sync::Arc<AppState>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut fetcher = BlockFetcher::new(&config.rpc_url, &config.rpc_user, &config.rpc_password, config.network)?;
     let classifier = TransactionClassifier::new();
     let latest_height = sync_historical_blocks(&config, &pool, &mut fetcher, &classifier, &state).await?;
@@ -54,6 +54,7 @@ pub async fn index_blocks(config: Config, pool: Pool<Postgres>, state: std::sync
                 Ok((block, height)) => {
                     if let Err(e) = handle_reorg(&pool, &mut fetcher, &block, height).await {
                         warn!("Reorg handling failed: {}. Skipping block {}", e, block_hash);
+                        let _ = db_tx.rollback().await;
                         continue;
                     }
 
@@ -89,12 +90,26 @@ pub async fn index_blocks(config: Config, pool: Pool<Postgres>, state: std::sync
                             query.push_bind(&tx.tx_hex);
                             query.push(")");
                         }
-                        query.build().execute(&mut db_tx).await?;
-                        TXS_INDEXED.inc_by(indexed_txs.len() as f64);
+                        match query.build().execute(&mut *db_tx).await {
+                            Ok(_) => TXS_INDEXED.inc_by(indexed_txs.len() as f64),
+                            Err(e) => {
+                                warn!("Failed to insert transactions: {}", e);
+                                let _ = db_tx.rollback().await;
+                                continue;
+                            }
+                        }
                     }
 
-                    index_block(&mut db_tx, &block, height).await?;
-                    db_tx.commit().await?;
+                    if let Err(e) = index_block(&mut db_tx, &block, height).await {
+                        warn!("Failed to index block: {}", e);
+                        let _ = db_tx.rollback().await;
+                        continue;
+                    }
+
+                    if let Err(e) = db_tx.commit().await {
+                        warn!("Failed to commit transaction: {}", e);
+                        continue;
+                    }
 
                     let elapsed = start_time.elapsed();
                     BLOCK_PROCESS_TIME.observe(elapsed.as_secs_f64());
@@ -106,6 +121,7 @@ pub async fn index_blocks(config: Config, pool: Pool<Postgres>, state: std::sync
                     );
                 }
                 Err(e) => {
+                    let _ = db_tx.rollback().await;
                     warn!("Error fetching block {}: {}. Retrying...", block_hash, e);
                     tokio::time::sleep(Duration::from_secs(ZMQ_RECONNECT_DELAY)).await;
                     continue;
@@ -124,15 +140,14 @@ async fn sync_historical_blocks(
     fetcher: &mut BlockFetcher,
     classifier: &TransactionClassifier,
     state: &std::sync::Arc<AppState>,
-) -> Result<i64, Box<dyn std::error::Error>> {
+) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
     let latest_height: Option<i64> = sqlx::query_scalar("SELECT MAX(height) FROM blocks")
         .fetch_one(pool)
         .await?;
     let start_height = latest_height.map(|h| h + 1).unwrap_or(config.start_height);
-    let tip_height = match fetcher.get_block_hash(i64::MAX) {
-        Ok(hash) => hash.parse::<i64>().unwrap_or(start_height),
-        Err(_) => start_height,
-    };
+    
+    // Get the actual chain tip height properly
+    let tip_height = fetcher.get_best_block_height().unwrap_or(start_height);
 
     for height in start_height..=tip_height {
         let block_hash = fetcher.get_block_hash(height)?;
@@ -171,7 +186,7 @@ async fn sync_historical_blocks(
                 query.push_bind(&tx.tx_hex);
                 query.push(")");
             }
-            query.build().execute(&mut db_tx).await?;
+            query.build().execute(&mut *db_tx).await?;
             TXS_INDEXED.inc_by(indexed_txs.len() as f64);
         }
 
@@ -189,14 +204,14 @@ pub async fn handle_reorg(
     fetcher: &mut BlockFetcher,
     new_block: &Block,
     new_height: i64,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut tx = pool.begin().await?;
     
     let prev_block: Option<BlockHeader> = sqlx::query_as(
         "SELECT block_hash, height, prev_hash FROM blocks WHERE height = $1"
     )
     .bind(new_height.saturating_sub(1))
-    .fetch_optional(&mut tx)
+    .fetch_optional(&mut *tx)
     .await?;
 
     if let Some(prev) = prev_block {
@@ -204,13 +219,13 @@ pub async fn handle_reorg(
         if prev.block_hash != prev_hash {
             warn!("Reorg detected at height {}. Rolling back...", new_height);
             sqlx::query("DELETE FROM transactions WHERE block_height >= $1")
-            .bind(new_height)
-            .execute(&mut tx)
-            .await?;
-            sqlx::query("DELETE FROM blocks WHERE block_height >= $1")
-            .bind(new_height)
-            .execute(&mut tx)
-            .await?;
+                .bind(new_height)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("DELETE FROM blocks WHERE height >= $1")
+                .bind(new_height)
+                .execute(&mut *tx)
+                .await?;
 
             let mut current_height = new_height;
             let mut current_hash = hex::encode(&sha256d(&{
@@ -218,8 +233,9 @@ pub async fn handle_reorg(
                 new_block.header.write(&mut bytes)?;
                 bytes
             }).0);
+            
             while current_height >= prev.height {
-                let (block, height) = fetcher.fetch_block(current_hash.as_str())?;
+                let (block, height) = fetcher.fetch_block(&current_hash)?;
                 index_block(&mut tx, &block, height).await?;
                 current_hash = hex::encode(&block.header.prev_hash.0);
                 current_height -= 1;
@@ -235,25 +251,26 @@ async fn index_block(
     tx: &mut PgTransaction<'_>,
     block: &Block,
     height: i64,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let block_hash = hex::encode(&sha256d(&{
         let mut bytes = Vec::new();
         block.header.write(&mut bytes)?;
         bytes
     }).0);
     let prev_hash = hex::encode(&block.header.prev_hash.0);
+    
     sqlx::query(
-    r#"
-    INSERT INTO blocks (block_hash, height, prev_hash)
-    VALUES ($1, $2, $3)
-    ON CONFLICT (block_hash, height) DO NOTHING
-    "#
-)
-.bind(&block_hash)
-.bind(height)
-.bind(&prev_hash)
-.execute(tx)
-.await?;
+        r#"
+        INSERT INTO blocks (block_hash, height, prev_hash)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (block_hash, height) DO NOTHING
+        "#
+    )
+    .bind(&block_hash)
+    .bind(height)
+    .bind(&prev_hash)
+    .execute(&mut **tx)
+    .await?;
 
     Ok(())
 }
