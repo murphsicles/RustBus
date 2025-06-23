@@ -24,7 +24,8 @@ impl BlockFetcher {
 
     pub fn fetch_block(&mut self, block_hash: &str) -> Result<(Block, i64), Box<dyn std::error::Error + Send + Sync>> {
         // Parse the hex string directly as BlockHash
-        let block_hash = BlockHash::from_hex(block_hash)?;
+        let block_bytes = hex::decode(block_hash)?;
+        let block_hash = BlockHash::from(&block_bytes[..]);
         
         // Get block as hex string
         let block_hex: Value = self.rpc.call("getblock", &[into_json(block_hash)?, 0.into()])?;
