@@ -58,9 +58,9 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-cargo-v8-${{ hashFiles('**/Cargo.lock', 'src/blockchain/indexer.rs', 'src/blockchain/fetcher.rs', 'src/utils.rs') }}
+          key: ${{ runner.os }}-cargo-v9-${{ hashFiles('**/Cargo.lock', 'src/blockchain/indexer.rs', 'src/blockchain/fetcher.rs', 'src/utils.rs') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-v8-
+            ${{ runner.os }}-cargo-v9-
       - name: Apply database schema
         run: psql -h localhost -U user -d rustbus -f schema.sql
         env:
