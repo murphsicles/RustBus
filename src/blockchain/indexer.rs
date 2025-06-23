@@ -30,10 +30,11 @@ pub async fn index_blocks(config: Config, pool: Pool<Postgres>, state: std::sync
     loop {
         let subscriber = zmq_context.socket(zmq::SUB).expect("Failed to create ZMQ socket");
         
+        let zmq_addr = config.zmq_addr.clone();
         let result: Result<(), backoff::Error<zmq::Error>> = retry(backoff.clone(), || {
             let subscriber_ref = &subscriber;
             async move {
-                subscriber_ref.connect(&config.zmq_addr).map_err(|e| backoff::Error::transient(e))?;
+                subscriber_ref.connect(&zmq_addr).map_err(|e| backoff::Error::transient(e))?;
                 subscriber_ref.set_subscribe(b"hashblock").map_err(|e| backoff::Error::transient(e))?;
                 Ok(())
             }
@@ -197,7 +198,7 @@ async fn insert_transaction_batch(
     
     query.push(" ON CONFLICT (txid) DO NOTHING");
     
-    query.build().execute(&mut db_tx).await.map_err(|e| {
+    query.build().execute(&mut *db_tx).await.map_err(|e| {
         error!("Failed to insert transaction batch of {} transactions: {}", batch.len(), e);
         e
     })?;
@@ -278,11 +279,11 @@ async fn find_fork_point(
     Ok(0)
 }
 
-async fn index_block(
-    mut tx: PgTransaction<'_>,
+async fn index_block<'a>(
+    mut tx: PgTransaction<'a>,
     block: &Block,
     height: i64,
-) -> Result<PgTransaction<'_>, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<PgTransaction<'a>, Box<dyn std::error::Error + Send + Sync>> {
     let block_hash = hex::encode(&sha256d(&{
         let mut bytes = Vec::new();
         block.header.write(&mut bytes)?;
