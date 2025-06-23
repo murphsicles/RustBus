@@ -227,12 +227,14 @@ async fn handle_reorg(
             warn!("Fork point found at height {}. Rolling back to height {}", fork_height, fork_height);
             
             let tx: &mut sqlx::Transaction<'_, Postgres> = &mut *tx;
+            info!("Transaction type in handle_reorg DELETE: {:?}", std::any::type_name_of_val(&tx));
             sqlx::query("DELETE FROM transactions WHERE block_height > $1")
                 .bind(fork_height)
                 .execute(tx)
                 .await?;
                 
             let tx: &mut sqlx::Transaction<'_, Postgres> = &mut *tx;
+            info!("Transaction type in handle_reorg DELETE: {:?}", std::any::type_name_of_val(&tx));
             sqlx::query("DELETE FROM blocks WHERE height > $1")
                 .bind(fork_height)
                 .execute(tx)
