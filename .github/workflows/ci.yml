@@ -35,9 +35,10 @@ jobs:
         run: |
           echo "Commit SHA: ${{ github.sha }}"
           git log -1 --pretty=%B
-          ls -l src/blockchain/indexer.rs src/utils.rs
-          sha256sum src/blockchain/indexer.rs src/utils.rs
+          ls -l src/blockchain/indexer.rs src/blockchain/fetcher.rs src/utils.rs
+          sha256sum src/blockchain/indexer.rs src/blockchain/fetcher.rs src/utils.rs
           cat src/blockchain/indexer.rs
+          cat src/blockchain/fetcher.rs
           cat src/utils.rs
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -57,9 +58,9 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-cargo-v7-${{ hashFiles('**/Cargo.lock', 'src/blockchain/indexer.rs', 'src/utils.rs') }}
+          key: ${{ runner.os }}-cargo-v8-${{ hashFiles('**/Cargo.lock', 'src/blockchain/indexer.rs', 'src/blockchain/fetcher.rs', 'src/utils.rs') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-v7-
+            ${{ runner.os }}-cargo-v8-
       - name: Apply database schema
         run: psql -h localhost -U user -d rustbus -f schema.sql
         env:
