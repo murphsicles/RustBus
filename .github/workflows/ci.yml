@@ -45,6 +45,10 @@ jobs:
         with:
           toolchain: stable
           components: clippy
+      - name: Log Rust and SQLx versions
+        run: |
+          rustc --version
+          cargo tree | grep sqlx
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y libpq-dev libzmq3-dev
       - name: Clean Cargo Cache
@@ -61,10 +65,6 @@ jobs:
           key: ${{ runner.os }}-cargo-v9-${{ hashFiles('**/Cargo.lock', 'src/blockchain/indexer.rs', 'src/blockchain/fetcher.rs', 'src/utils.rs') }}
           restore-keys: |
             ${{ runner.os }}-cargo-v9-
-      - name: Apply database schema
-        run: psql -h localhost -U user -d rustbus -f schema.sql
-        env:
-          PGPASSWORD: pass
       - name: Run clippy
         run: cargo clippy --all-targets --all-features
       - name: Run tests
