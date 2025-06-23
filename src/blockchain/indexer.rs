@@ -89,7 +89,7 @@ async fn process_new_block(
     
     let (block, height) = fetcher.fetch_block(block_hash)?;
     
-    db_tx = handle_reorg(&pool, fetcher, &block, height, db_tx).await?;
+    let db_tx = handle_reorg(&pool, fetcher, &block, height, db_tx).await?;
     let tx_count = process_block_transactions(&mut db_tx, &block, height, classifier).await?;
     let db_tx = index_block(db_tx, &block, height).await?;
 
@@ -121,7 +121,7 @@ async fn sync_historical_blocks(
         let (block, height) = fetcher.fetch_block(&block_hash)?;
         let mut db_tx = pool.begin().await?;
 
-        db_tx = handle_reorg(&pool, fetcher, &block, height, db_tx).await?;
+        let db_tx = handle_reorg(&pool, fetcher, &block, height, db_tx).await?;
         let tx_count = process_block_transactions(&mut db_tx, &block, height, classifier).await?;
         let db_tx = index_block(db_tx, &block, height).await?;
 
@@ -225,17 +225,15 @@ pub async fn handle_reorg<'a>(
             
             warn!("Fork point found at height {}. Rolling back to height {}", fork_height, fork_height);
             
-            tx = sqlx::query("DELETE FROM transactions WHERE block_height > $1")
+            sqlx::query("DELETE FROM transactions WHERE block_height > $1")
                 .bind(fork_height)
-                .execute(tx)
-                .await?
-                .0;
+                .execute(&mut tx)
+                .await?;
                 
-            tx = sqlx::query("DELETE FROM blocks WHERE height > $1")
+            sqlx::query("DELETE FROM blocks WHERE height > $1")
                 .bind(fork_height)
-                .execute(tx)
-                .await?
-                .0;
+                .execute(&mut tx)
+                .await?;
             
             info!("Rolled back blocks from height {} to {}", new_height, fork_height + 1);
         }
