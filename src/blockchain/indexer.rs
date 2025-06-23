@@ -33,7 +33,7 @@ pub async fn index_blocks(config: Config, pool: Pool<Postgres>, state: std::sync
         let zmq_addr = config.zmq_addr.clone();
         let result: Result<(), backoff::Error<zmq::Error>> = retry(backoff.clone(), || {
             let subscriber_ref = &subscriber;
-            async move {
+            async {
                 subscriber_ref.connect(&zmq_addr).map_err(|e| backoff::Error::transient(e))?;
                 subscriber_ref.set_subscribe(b"hashblock").map_err(|e| backoff::Error::transient(e))?;
                 Ok(())
