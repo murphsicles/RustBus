@@ -291,7 +291,7 @@ async fn index_block(
     
     let prev_hash = hex::encode(&block.header.prev_hash.0);
     
-    let tx: &mut sqlx::Transaction<'_, Postgres> = &mut *tx;
+    let tx: &mut sqlx::Transaction<'_, Postgres> = tx;
     info!("Transaction type in index_block: {:?}", std::any::type_name_of_val(&tx));
     sqlx::query(
         r#"
