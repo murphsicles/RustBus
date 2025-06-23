@@ -89,14 +89,7 @@ async fn process_new_block(
     
     let (block, height) = fetcher.fetch_block(block_hash)?;
     
-    if let Err(e) = handle_reorg(&pool, fetcher, &block, height).await {
-        warn!("Reorg handling failed for block {}: {}. Skipping block", block_hash, e);
-        if let Err(rollback_err) = db_tx.rollback().await {
-            warn!("Failed to rollback transaction: {}", rollback_err);
-        }
-        return Err(e);
-    }
-
+    db_tx = handle_reorg(&pool, fetcher, &block, height, db_tx).await?;
     let tx_count = process_block_transactions(&mut db_tx, &block, height, classifier).await?;
     let db_tx = index_block(db_tx, &block, height).await?;
 
@@ -128,6 +121,7 @@ async fn sync_historical_blocks(
         let (block, height) = fetcher.fetch_block(&block_hash)?;
         let mut db_tx = pool.begin().await?;
 
+        db_tx = handle_reorg(&pool, fetcher, &block, height, db_tx).await?;
         let tx_count = process_block_transactions(&mut db_tx, &block, height, classifier).await?;
         let db_tx = index_block(db_tx, &block, height).await?;
 
@@ -206,14 +200,13 @@ async fn insert_transaction_batch(
     Ok(())
 }
 
-pub async fn handle_reorg(
+pub async fn handle_reorg<'a>(
     pool: &Pool<Postgres>,
     fetcher: &mut BlockFetcher,
     new_block: &Block,
     new_height: i64,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut tx = pool.begin().await?;
-    
+    mut tx: PgTransaction<'a>,
+) -> Result<PgTransaction<'a>, Box<dyn std::error::Error + Send + Sync>> {
     let prev_block: Option<BlockHeader> = sqlx::query_as(
         "SELECT block_hash, height, prev_hash FROM blocks WHERE height = $1"
     )
@@ -232,22 +225,23 @@ pub async fn handle_reorg(
             
             warn!("Fork point found at height {}. Rolling back to height {}", fork_height, fork_height);
             
-            sqlx::query("DELETE FROM transactions WHERE block_height > $1")
+            tx = sqlx::query("DELETE FROM transactions WHERE block_height > $1")
                 .bind(fork_height)
-                .execute(&mut tx)
-                .await?;
+                .execute(tx)
+                .await?
+                .0;
                 
-            sqlx::query("DELETE FROM blocks WHERE height > $1")
+            tx = sqlx::query("DELETE FROM blocks WHERE height > $1")
                 .bind(fork_height)
-                .execute(&mut tx)
-                .await?;
+                .execute(tx)
+                .await?
+                .0;
             
             info!("Rolled back blocks from height {} to {}", new_height, fork_height + 1);
         }
     }
 
-    tx.commit().await?;
-    Ok(())
+    Ok(tx)
 }
 
 async fn find_fork_point(
