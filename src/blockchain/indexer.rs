@@ -167,7 +167,7 @@ async fn process_block_transactions(
     // Process transactions in batches to avoid memory issues
     let mut db_tx = db_tx;
     for batch in indexed_txs.chunks(BATCH_SIZE) {
-        db_tx = insert_transaction_batch(db_tx, batch).await?;
+        *db_tx = insert_transaction_batch(*db_tx, batch).await?;
     }
 
     TXS_INDEXED.inc_by(indexed_txs.len() as f64);
