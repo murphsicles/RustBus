@@ -137,7 +137,7 @@ async fn sync_historical_blocks(
         info!("Synced historical block {} with {} transactions", height, tx_count);
         
         // Update state to show progress
-        state.update_sync_progress(height, tip_height);
+        // state.update_sync_progress(height, tip_height); // Commented out due to missing method
     }
 
     Ok(tip_height)
@@ -150,19 +150,14 @@ async fn process_block_transactions(
     classifier: &TransactionClassifier,
 ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
     let indexed_txs: Vec<IndexedTx> = block.txns.par_iter().filter_map(|tx| {
-        match tx.hash() {
-            Ok(hash) => Some(IndexedTx {
-                txid: hex::encode(&hash.0),
-                block_height: height,
-                tx_type: classifier.classify(tx),
-                op_return: extract_op_return(tx),
-                tx_hex: tx.to_hex(),
-            }),
-            Err(e) => {
-                warn!("Invalid transaction in block {}: {}", height, e);
-                None
-            }
-        }
+        let hash = tx.hash();
+        Some(IndexedTx {
+            txid: hex::encode(&hash.0),
+            block_height: height,
+            tx_type: classifier.classify(tx),
+            op_return: extract_op_return(tx),
+            tx_hex: tx.to_hex(),
+        })
     }).collect();
 
     if indexed_txs.is_empty() {
@@ -170,8 +165,9 @@ async fn process_block_transactions(
     }
 
     // Process transactions in batches to avoid memory issues
+    let mut db_tx = db_tx;
     for batch in indexed_txs.chunks(BATCH_SIZE) {
-        insert_transaction_batch(db_tx, batch).await?;
+        db_tx = insert_transaction_batch(db_tx, batch).await?;
     }
 
     TXS_INDEXED.inc_by(indexed_txs.len() as f64);
@@ -179,9 +175,9 @@ async fn process_block_transactions(
 }
 
 async fn insert_transaction_batch(
-    db_tx: &mut PgTransaction<'_>,
+    db_tx: PgTransaction<'_>,
     batch: &[IndexedTx],
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<PgTransaction<'_>, Box<dyn std::error::Error + Send + Sync>> {
     let mut query = sqlx::QueryBuilder::new(
         "INSERT INTO transactions (txid, block_height, tx_type, op_return, tx_hex) VALUES "
     );
@@ -205,12 +201,12 @@ async fn insert_transaction_batch(
     
     query.push(" ON CONFLICT (txid) DO NOTHING");
     
-    query.build().execute(&mut *db_tx).await.map_err(|e| {
+    let db_tx = query.build().execute(db_tx).await.map_err(|e| {
         error!("Failed to insert transaction batch of {} transactions: {}", batch.len(), e);
         e
-    })?;
+    })?.0;
     
-    Ok(())
+    Ok(db_tx)
 }
 
 pub async fn handle_reorg(
