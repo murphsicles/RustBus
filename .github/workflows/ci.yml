@@ -49,6 +49,8 @@ jobs:
         run: |
           rustc --version
           cargo tree | grep sqlx
+      - name: Log dependency versions
+        run: cargo tree
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y libpq-dev libzmq3-dev
       - name: Clean Cargo Cache
@@ -62,9 +64,13 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-cargo-v9-${{ hashFiles('**/Cargo.lock', 'src/blockchain/indexer.rs', 'src/blockchain/fetcher.rs', 'src/utils.rs') }}
+          key: ${{ runner.os }}-cargo-v10-${{ hashFiles('**/Cargo.lock', 'src/blockchain/indexer.rs', 'src/blockchain/fetcher.rs', 'src/utils.rs') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-v9-
+            ${{ runner.os }}-cargo-v10-
+      - name: Verify database connectivity
+        run: psql -h localhost -U user -d rustbus -c "SELECT 1"
+        env:
+          PGPASSWORD: pass
       - name: Run clippy
         run: cargo clippy --all-targets --all-features
       - name: Run tests
