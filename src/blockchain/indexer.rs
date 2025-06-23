@@ -207,12 +207,10 @@ pub async fn handle_reorg(
     new_height: i64,
     tx: &mut PgTransaction<'_>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let prev_block: Option<BlockHeader> = sqlx::query_as(
+    let prev_block: Option<BlockHeader> = (&mut *tx).fetch_optional(sqlx::query_as(
         "SELECT block_hash, height, prev_hash FROM blocks WHERE height = $1"
     )
-    .bind(new_height - 1)
-    .fetch_optional(&mut *tx)
-    .await?;
+    .bind(new_height - 1)).await?;
 
     if let Some(prev) = prev_block {
         let expected_prev_hash = hex::encode(&new_block.header.prev_hash.0);
