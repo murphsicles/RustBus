@@ -84,7 +84,7 @@ async fn process_new_block(
     fetcher: &mut BlockFetcher,
     classifier: &TransactionClassifier,
     block_hash: &str,
-) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<usize, Box<dyn std::.error::Error + Send + Sync>> {
     let mut db_tx = pool.begin().await?;
     
     let (block, height) = fetcher.fetch_block(block_hash)?;
@@ -165,9 +165,9 @@ async fn process_block_transactions(
     Ok(indexed_txs.len())
 }
 
-async fn insert_transaction_batch<'a>(
-    db_tx: &mut PgTransaction<'a>,
-    batch: &'a [IndexedTx],
+async fn insert_transaction_batch(
+    db_tx: &mut PgTransaction<'_>,
+    batch: &[IndexedTx],
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut query = sqlx::QueryBuilder::new(
         "INSERT INTO transactions (txid, block_height, tx_type, op_return, tx_hex) VALUES "
@@ -200,12 +200,12 @@ async fn insert_transaction_batch<'a>(
     Ok(())
 }
 
-pub async fn handle_reorg<'a>(
+async fn handle_reorg(
     pool: &Pool<Postgres>,
     fetcher: &mut BlockFetcher,
     new_block: &Block,
     new_height: i64,
-    tx: &mut PgTransaction<'a>,
+    tx: &mut PgTransaction<'_>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let prev_block: Option<BlockHeader> = sqlx::query_as(
         "SELECT block_hash, height, prev_hash FROM blocks WHERE height = $1"
@@ -271,13 +271,13 @@ async fn find_fork_point(
     Ok(0)
 }
 
-async fn index_block<'a>(
-    tx: &mut PgTransaction<'a>,
+async fn index_block(
+    tx: &mut PgTransaction<'_>,
     block: &Block,
     height: i64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let block_hash = hex::encode(&sha256d(&{
-        let mut bytes = Vec::new();
+        let mut bytes = Vec::new;
         block.header.write(&mut bytes)?;
         bytes
     }).0);
