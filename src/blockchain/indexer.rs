@@ -90,7 +90,7 @@ pub async fn index_blocks(config: Config, pool: Pool<Postgres>, state: std::sync
                             query.push_bind(&tx.tx_hex);
                             query.push(")");
                         }
-                        match query.build().execute(&mut *db_tx).await {
+                        match query.build().execute(&mut db_tx).await {
                             Ok(_) => TXS_INDEXED.inc_by(indexed_txs.len() as f64),
                             Err(e) => {
                                 warn!("Failed to insert transactions: {}", e);
@@ -145,8 +145,6 @@ async fn sync_historical_blocks(
         .fetch_one(pool)
         .await?;
     let start_height = latest_height.map(|h| h + 1).unwrap_or(config.start_height);
-    
-    // Get the actual chain tip height properly
     let tip_height = fetcher.get_best_block_height().unwrap_or(start_height);
 
     for height in start_height..=tip_height {
@@ -186,7 +184,7 @@ async fn sync_historical_blocks(
                 query.push_bind(&tx.tx_hex);
                 query.push(")");
             }
-            query.build().execute(&mut *db_tx).await?;
+            query.build().execute(&mut db_tx).await?;
             TXS_INDEXED.inc_by(indexed_txs.len() as f64);
         }
 
@@ -211,7 +209,7 @@ pub async fn handle_reorg(
         "SELECT block_hash, height, prev_hash FROM blocks WHERE height = $1"
     )
     .bind(new_height.saturating_sub(1))
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut tx)
     .await?;
 
     if let Some(prev) = prev_block {
@@ -220,11 +218,11 @@ pub async fn handle_reorg(
             warn!("Reorg detected at height {}. Rolling back...", new_height);
             sqlx::query("DELETE FROM transactions WHERE block_height >= $1")
                 .bind(new_height)
-                .execute(&mut *tx)
+                .execute(&mut tx)
                 .await?;
-            sqlx::query("DELETE FROM blocks WHERE height >= $1")
+            sqlx::query("DELETE FROM blocks WHERE block_height >= $1")
                 .bind(new_height)
-                .execute(&mut *tx)
+                .execute(&mut tx)
                 .await?;
 
             let mut current_height = new_height;
@@ -233,9 +231,8 @@ pub async fn handle_reorg(
                 new_block.header.write(&mut bytes)?;
                 bytes
             }).0);
-            
             while current_height >= prev.height {
-                let (block, height) = fetcher.fetch_block(&current_hash)?;
+                let (block, height) = fetcher.fetch_block(current_hash.as_str())?;
                 index_block(&mut tx, &block, height).await?;
                 current_hash = hex::encode(&block.header.prev_hash.0);
                 current_height -= 1;
@@ -258,7 +255,6 @@ async fn index_block(
         bytes
     }).0);
     let prev_hash = hex::encode(&block.header.prev_hash.0);
-    
     sqlx::query(
         r#"
         INSERT INTO blocks (block_hash, height, prev_hash)
@@ -269,7 +265,7 @@ async fn index_block(
     .bind(&block_hash)
     .bind(height)
     .bind(&prev_hash)
-    .execute(&mut **tx)
+    .execute(&mut *tx)
     .await?;
 
     Ok(())
