@@ -6,7 +6,7 @@ use super::super::AppState;
 use crate::utils::{extract_op_return, TxExt};
 use sv::messages::Block;
 use sv::util::{sha256d, Serializable};
-use sqlx::{Pool, Postgres, postgres::PgTransaction};
+use sqlx::{Pool, Postgres, postgres::PgTransaction, Executor};
 use log::{info, warn, error};
 use rayon::prelude::*;
 use backoff::{ExponentialBackoff, future::retry};
@@ -192,8 +192,7 @@ async fn insert_transaction_batch(
     
     query.push(" ON CONFLICT (txid) DO NOTHING");
     
-    let db_tx: &mut sqlx::Transaction<'_, Postgres> = &mut *db_tx;
-    query.build().execute(&mut *db_tx).await.map_err(|e| {
+    (&mut *db_tx).execute(query.build()).await.map_err(|e| {
         error!("Failed to insert transaction batch of {} transactions: {}", batch.len(), e);
         e
     })?;
@@ -208,7 +207,6 @@ pub async fn handle_reorg(
     new_height: i64,
     tx: &mut PgTransaction<'_>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let tx: &mut sqlx::Transaction<'_, Postgres> = &mut *tx;
     let prev_block: Option<BlockHeader> = sqlx::query_as(
         "SELECT block_hash, height, prev_hash FROM blocks WHERE height = $1"
     )
@@ -227,17 +225,11 @@ pub async fn handle_reorg(
             
             warn!("Fork point found at height {}. Rolling back to height {}", fork_height, fork_height);
             
-            let tx: &mut sqlx::Transaction<'_, Postgres> = &mut *tx;
-            sqlx::query("DELETE FROM transactions WHERE block_height > $1")
-                .bind(fork_height)
-                .execute(&mut *tx)
-                .await?;
+            (&mut *tx).execute(sqlx::query("DELETE FROM transactions WHERE block_height > $1")
+                .bind(fork_height)).await?;
                 
-            let tx: &mut sqlx::Transaction<'_, Postgres> = &mut *tx;
-            sqlx::query("DELETE FROM blocks WHERE height > $1")
-                .bind(fork_height)
-                .execute(&mut *tx)
-                .await?;
+            (&mut *tx).execute(sqlx::query("DELETE FROM blocks WHERE height > $1")
+                .bind(fork_height)).await?;
             
             info!("Rolled back blocks from height {} to {}", new_height, fork_height + 1);
         }
@@ -288,7 +280,7 @@ async fn index_block(
     
     let prev_hash = hex::encode(&block.header.prev_hash.0);
     
-    sqlx::query(
+    (&mut *tx).execute(sqlx::query(
         r#"
         INSERT INTO blocks (block_hash, height, prev_hash, timestamp)
         VALUES ($1, $2, $3, $4)
@@ -298,9 +290,7 @@ async fn index_block(
     .bind(&block_hash)
     .bind(height)
     .bind(&prev_hash)
-    .bind(block.header.timestamp as i64)
-    .execute(&mut *tx)
-    .await?;
+    .bind(block.header.timestamp as i64)).await?;
     
     Ok(())
 }
