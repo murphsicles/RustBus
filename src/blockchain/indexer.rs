@@ -272,7 +272,7 @@ async fn find_fork_point(
 }
 
 async fn index_block<'a>(
-    mut tx: PgTransaction<'a>,
+    tx: PgTransaction<'a>,
     block: &Block,
     height: i64,
 ) -> Result<PgTransaction<'a>, Box<dyn std::error::Error + Send + Sync>> {
@@ -284,7 +284,7 @@ async fn index_block<'a>(
     
     let prev_hash = hex::encode(&block.header.prev_hash.0);
     
-    sqlx::query(
+    let tx = sqlx::query(
         r#"
         INSERT INTO blocks (block_hash, height, prev_hash, timestamp)
         VALUES ($1, $2, $3, $4)
@@ -295,8 +295,9 @@ async fn index_block<'a>(
     .bind(height)
     .bind(&prev_hash)
     .bind(block.header.timestamp as i64)
-    .execute(&mut tx)
-    .await?;
+    .execute(tx)
+    .await?
+    .0;
     
     Ok(tx)
 }
