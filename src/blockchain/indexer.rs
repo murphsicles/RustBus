@@ -205,7 +205,7 @@ async fn insert_transaction_batch(
     
     query.push(" ON CONFLICT (txid) DO NOTHING");
     
-    query.build().execute(&mut **db_tx).await.map_err(|e| {
+    query.build().execute(&mut *db_tx).await.map_err(|e| {
         error!("Failed to insert transaction batch of {} transactions: {}", batch.len(), e);
         e
     })?;
@@ -226,7 +226,7 @@ pub async fn handle_reorg(
         "SELECT block_hash, height, prev_hash FROM blocks WHERE height = $1"
     )
     .bind(new_height - 1)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut tx)
     .await?;
 
     if let Some(prev) = prev_block {
@@ -244,12 +244,12 @@ pub async fn handle_reorg(
             // Remove all blocks and transactions from fork point onwards
             sqlx::query("DELETE FROM transactions WHERE block_height > $1")
                 .bind(fork_height)
-                .execute(&mut *tx)
+                .execute(&mut tx)
                 .await?;
                 
             sqlx::query("DELETE FROM blocks WHERE height > $1")
                 .bind(fork_height)
-                .execute(&mut *tx)
+                .execute(&mut tx)
                 .await?;
             
             info!("Rolled back blocks from height {} to {}", new_height, fork_height + 1);
@@ -318,11 +318,8 @@ async fn index_block(
     .bind(height)
     .bind(&prev_hash)
     .bind(block.header.timestamp as i64)
-    .execute(&mut **tx)
-    .await.map_err(|e| {
-        error!("Failed to insert block {} at height {}: {}", block_hash, height, e);
-        e
-    })?;
+    .execute(&mut *tx)
+    .await?;
 
     Ok(())
 }
