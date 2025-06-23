@@ -200,7 +200,7 @@ async fn insert_transaction_batch(
     Ok(())
 }
 
-async fn handle_reorg(
+pub async fn handle_reorg(
     pool: &Pool<Postgres>,
     fetcher: &mut BlockFetcher,
     new_block: &Block,
