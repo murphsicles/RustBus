@@ -15,6 +15,7 @@ pub async fn init_db(pool: &Pool<Postgres>, max_height: i64) -> Result<(), sqlx:
             block_hash TEXT NOT NULL,
             height BIGINT NOT NULL,
             prev_hash TEXT NOT NULL,
+            timestamp BIGINT NOT NULL,
             PRIMARY KEY (block_hash, height)
         ) PARTITION BY RANGE (height);
         "#
