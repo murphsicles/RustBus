@@ -34,7 +34,7 @@ pub async fn index_blocks(config: Config, pool: Pool<Postgres>, state: std::sync
             subscriber.connect(&config.zmq_addr).map_err(|e| backoff::Error::transient(e))?;
             subscriber.set_subscribe(b"hashblock").map_err(|e| backoff::Error::transient(e))?;
             Ok(())
-        }).await;
+        }).await?;
 
         if result.is_err() {
             warn!("Failed to reconnect to ZMQ after retries. Exiting...");
