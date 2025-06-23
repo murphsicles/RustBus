@@ -184,12 +184,26 @@ async fn sync_historical_blocks(
                 query.push_bind(&tx.tx_hex);
                 query.push(")");
             }
-            query.build().execute(&mut db_tx).await?;
-            TXS_INDEXED.inc_by(indexed_txs.len() as f64);
+            match query.build().execute(&mut db_tx).await {
+                Ok(_) => TXS_INDEXED.inc_by(indexed_txs.len() as f64),
+                Err(e) => {
+                    warn!("Failed to insert transactions: {}", e);
+                    let _ = db_tx.rollback().await;
+                    continue;
+                }
+            }
         }
 
-        index_block(&mut db_tx, &block, height).await?;
-        db_tx.commit().await?;
+        if let Err(e) = index_block(&mut db_tx, &block, height).await {
+            warn!("Failed to index block: {}", e);
+            let _ = db_tx.rollback().await;
+            continue;
+        }
+
+        if let Err(e) = db_tx.commit().await {
+            warn!("Failed to commit transaction: {}", e);
+            continue;
+        }
 
         info!("Synced historical block {} with {} transactions", height, indexed_txs.len());
     }
