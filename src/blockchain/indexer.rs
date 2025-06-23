@@ -288,6 +288,7 @@ async fn index_block(
     let prev_hash = hex::encode(&block.header.prev_hash.0);
     
     let tx: &mut sqlx::Transaction<'_, Postgres> = &mut *tx;
+    info!("Transaction type in index_block: {:?}", std::any::type_name_of_val(&tx));
     sqlx::query(
         r#"
         INSERT INTO blocks (block_hash, height, prev_hash, timestamp)
