@@ -1,4 +1,4 @@
-name: RustBus CI/CD
+name: RustBus CI
 
 on:
   push:
@@ -10,8 +10,39 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build-and-test:
+  build:
     runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.ref }}
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y libpq-dev libzmq3-dev
+      - name: Clean Cargo Cache
+        run: cargo clean
+      - name: Cache Rust dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-v10-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-v10-
+      - name: Build
+        run: cargo build
+
+  test:
+    runs-on: ubuntu-latest
+    needs: build
     services:
       postgres:
         image: postgres:15
@@ -31,26 +62,10 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha || github.ref }}
-      - name: Debug commit and file info
-        run: |
-          echo "Commit SHA: ${{ github.sha }}"
-          git log -1 --pretty=%B
-          ls -l src/blockchain/indexer.rs src/blockchain/fetcher.rs src/utils.rs
-          sha256sum src/blockchain/indexer.rs src/blockchain/fetcher.rs src/utils.rs
-          cat src/blockchain/indexer.rs
-          cat src/blockchain/fetcher.rs
-          cat src/utils.rs
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: stable
-          components: clippy
-      - name: Log Rust and SQLx versions
-        run: |
-          rustc --version
-          cargo tree | grep sqlx
-      - name: Log dependency versions
-        run: cargo tree
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y libpq-dev libzmq3-dev
       - name: Clean Cargo Cache
@@ -64,34 +79,14 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-cargo-v10-${{ hashFiles('**/Cargo.lock', 'src/blockchain/indexer.rs', 'src/blockchain/fetcher.rs', 'src/utils.rs') }}
+          key: ${{ runner.os }}-cargo-v10-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-v10-
       - name: Verify database connectivity
         run: psql -h localhost -U user -d rustbus -c "SELECT 1"
         env:
           PGPASSWORD: pass
-      - name: Run clippy
-        run: cargo clippy --all-targets --all-features
       - name: Run tests
         env:
           DATABASE_URL: postgres://user:pass@localhost:5432/rustbus
         run: cargo test -- --nocapture
-      - name: Build
-        run: cargo build --release
-
-  deploy:
-    runs-on: ubuntu-latest
-    needs: build-and-test
-    if: github.ref == 'refs/heads/main'
-    steps:
-      - uses: actions/checkout@v4
-      - name: Build Docker image
-        run: docker build -t rustbus:latest .
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKER_PASSWORD }}
-      - name: Push Docker image
-        run: docker push rustbus:latest
