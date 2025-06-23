@@ -264,6 +264,7 @@ async fn index_block(
     height: i64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let block_hash = hex::encode(&sha256d(&{
+       Build and test / build-and-test (pull_request) Failing after 2m — build-and-test
         let mut bytes = Vec::new();
         block.header.write(&mut bytes)?;
         bytes
