@@ -1,10 +1,14 @@
+use sv::script::{Script, Opcode};
 use sv::messages::Tx;
 use sv::util::Serializable;
 
 pub fn extract_op_return(tx: &Tx) -> Option<String> {
     tx.outputs.iter()
-        .find(|out| out.lock_script.is_op_return())
-        .and_then(|out| Some(hex::encode(&out.lock_script.0)))
+        .find(|out| {
+            let script = &out.lock_script;
+            script.len() > 0 && script.as_bytes()[0] == Opcode::OP_RETURN as u8
+        })
+        .map(|out| hex::encode(&out.lock_script.as_bytes()))
 }
 
 pub trait TxExt {
