@@ -1,5 +1,4 @@
 use sv::messages::Tx;
-use sv::script::Script;
 use sv::util::Serializable;
 
 pub fn extract_op_return(tx: &Tx) -> Option<String> {
