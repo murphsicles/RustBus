@@ -10,6 +10,7 @@ use dashmap::DashMap;
 use tokio::sync::broadcast;
 use super::models::{IndexedTx, Subscription};
 
+#[derive(Clone)]
 pub struct AppState {
     pub db_pool: PgPool,
     pub subscriptions: Arc<DashMap<String, Subscription>>,
