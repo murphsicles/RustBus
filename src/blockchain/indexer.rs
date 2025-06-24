@@ -3,10 +3,10 @@ use super::classifier::TransactionClassifier;
 use super::super::config::Config;
 use super::super::models::{IndexedTx, BlockHeader};
 use super::super::AppState;
+use super::super::metrics::{TXS_INDEXED, BLOCK_PROCESS_TIME};
 use crate::utils::{extract_op_return, TxExt};
 use sv::messages::Block;
 use sv::util::{sha256d, Serializable};
-use shooting_star::metrics::{TXS_INDEXED, BLOCK_PROCESS_TIME};
 use sqlx::{Pool, Postgres, postgres::PgTransaction};
 use log::{info, warn, error};
 use rayon::prelude::*;
@@ -122,7 +122,7 @@ async fn sync_historical_blocks(
         let mut db_tx = pool.begin().await?;
 
         handle_reorg(&pool, fetcher, &block, height, &mut db_tx).await?;
-        let tx_count = process_block_transactions(&mut db_tx, &block, height, classifier).await?;
+        let tx_count = process_block_transactions(&mut db_ts, &block, height, classifier).await?;
         index_block(&mut db_tx, &block, height).await?;
 
         db_tx.commit().await.map_err(|e| {
@@ -192,7 +192,8 @@ async fn insert_transaction_batch(
     
     query.push(" ON CONFLICT (txid) DO NOTHING");
     
-    query.build().execute(&mut *db_tx).await.map_err(|e| {
+    let db_tx: &mut sqlx::Transaction<'_, Postgres> = &mut *db_tx;
+    query.build().execute(db_tx).await.map_err(|e| {
         error!("Failed to insert transaction batch of {} transactions: {}", batch.len(), e);
         e
     })?;
@@ -207,11 +208,12 @@ pub async fn handle_reorg(
     new_height: i64,
     tx: &mut PgTransaction<'_>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let tx: &mut sqlx::Transaction<'_, Postgres> = &mut *tx;
     let prev_block: Option<BlockHeader> = sqlx::query_as(
         "SELECT block_hash, height, prev_hash FROM blocks WHERE height = $1"
     )
     .bind(new_height - 1)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(tx)
     .await?;
 
     if let Some(prev) = prev_block {
@@ -225,14 +227,16 @@ pub async fn handle_reorg(
             
             warn!("Fork point found at height {}. Rolling back to height {}", fork_height, fork_height);
             
+            let tx: &mut sqlx::Transaction<'_, Postgres> = &mut *tx;
             sqlx::query("DELETE FROM transactions WHERE block_height > $1")
                 .bind(fork_height)
-                .execute(&mut *tx)
+                .execute(tx)
                 .await?;
                 
+            let tx: &mut sqlx::Transaction<'_, Postgres> = &mut *tx;
             sqlx::query("DELETE FROM blocks WHERE height > $1")
                 .bind(fork_height)
-                .execute(&mut *tx)
+                .execute(tx)
                 .await?;
             
             info!("Rolled back blocks from height {} to {}", new_height, fork_height + 1);
@@ -284,6 +288,7 @@ async fn index_block(
     
     let prev_hash = hex::encode(&block.header.prev_hash.0);
     
+    let tx: &mut sqlx::Transaction<'_, Postgres> = &mut *tx;
     sqlx::query(
         r#"
         INSERT INTO blocks (block_hash, height, prev_hash, timestamp)
@@ -295,7 +300,7 @@ async fn index_block(
     .bind(height)
     .bind(&prev_hash)
     .bind(block.header.timestamp as i64)
-    .execute(&mut *tx)
+    .execute(tx)
     .await?;
     
     Ok(())
