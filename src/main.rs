@@ -15,7 +15,7 @@ async fn main() -> std::io::Result<()> {
     dotenvy::dotenv().ok();
     env_logger::init();
 
-    let config = Config::from_env().map_err(|e: Box<dyn std::error::Error + Send + Sync>| {
+    let config = Config::from_env().map_err(|e: Box<dyn std::error::Error>| {
         std::io::Error::new(std::io::ErrorKind::Other, e)
     })?;
     let pool = PgPoolOptions::new()
@@ -29,7 +29,7 @@ async fn main() -> std::io::Result<()> {
 
     let state = rustbus::AppState::new(pool.clone(), &config)
         .await
-        .map_err(|e: Box<dyn std::error::Error + Send + Sync>| {
+        .map_err(|e: Box<dyn std::error::Error>| {
             std::io::Error::new(std::io::ErrorKind::Other, e)
         })?;
     let index_config = config.clone();
@@ -59,15 +59,18 @@ async fn main() -> std::io::Result<()> {
 
     info!("Starting HTTP server at {}", config.bind_addr);
     HttpServer::new(move || {
+        let state_data = web::Data::new(state.clone());
         App::new()
-            .app_data(web::Data::new(state.clone()))
+            .app_data(state_data.clone())
             .route("/ws", web::get().to(ws_route))
             .service(get_tx)
             .service(list_txs)
             .service(
                 web::resource("/graphql")
-                    .app_data(web::Data::new(state.clone())) // Add state for graphql
-                    .route(web::post().to(graphql))
+                    .app_data(state_data.clone())
+                    .route(web::post().to(move |req, data| {
+                        graphql(data, req) // Wrap graphql to pass state.schema
+                    }))
                     .route(web::get().to(graphiql)),
             )
     })
