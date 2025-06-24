@@ -15,7 +15,9 @@ async fn main() -> std::io::Result<()> {
     dotenvy::dotenv().ok();
     env_logger::init();
 
-    let config = Config::from_env().map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let config = Config::from_env().map_err(|e: Box<dyn std::error::Error + Send + Sync>| {
+        std::io::Error::new(std::io::ErrorKind::Other, e)
+    })?;
     let pool = PgPoolOptions::new()
         .max_connections(10)
         .connect(&config.db_url)
@@ -27,7 +29,9 @@ async fn main() -> std::io::Result<()> {
 
     let state = rustbus::AppState::new(pool.clone(), &config)
         .await
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(|e: Box<dyn std::error::Error + Send + Sync>| {
+            std::io::Error::new(std::io::ErrorKind::Other, e)
+        })?;
     let index_config = config.clone();
     let index_state = Arc::new(state.clone());
     tokio::spawn(async move {
@@ -38,15 +42,18 @@ async fn main() -> std::io::Result<()> {
 
     let metrics_config = config.clone();
     tokio::spawn(async move {
-        if let Err(e) = HttpServer::new(|| {
-            App::new()
-                .route("/metrics", web::get().to(metrics))
+        let server = HttpServer::new(|| {
+            App::new().route("/metrics", web::get().to(metrics))
         })
-        .bind(("0.0.0.0", metrics_config.metrics_port))?
-        .run()
-        .await
-        {
-            error!("Metrics server failed: {}", e);
+        .bind(("0.0.0.0", metrics_config.metrics_port))
+        .map_err(|e| {
+            error!("Metrics server bind failed: {}", e);
+            e
+        });
+        if let Ok(server) = server {
+            if let Err(e) = server.run().await {
+                error!("Metrics server failed: {}", e);
+            }
         }
     });
 
@@ -59,8 +66,9 @@ async fn main() -> std::io::Result<()> {
             .service(list_txs)
             .service(
                 web::resource("/graphql")
+                    .app_data(web::Data::new(state.clone())) // Add state for graphql
                     .route(web::post().to(graphql))
-                    .route(web::get().to(graphiql))
+                    .route(web::get().to(graphiql)),
             )
     })
     .bind(&config.bind_addr)?
