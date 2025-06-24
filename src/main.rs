@@ -74,7 +74,7 @@ async fn main() -> std::io::Result<()> {
                         let schema = state.schema.clone();
                         GraphQLResponse::from(schema.execute(req.into_inner()).await)
                     }))
-                    .route(web::get().to(|_req: HttpRequest| async move { graphiql().await })),
+                    .route(web::get().to(|_req: HttpRequest| async move { rustbus::graphql::graphiql().await })),
             )
     })
     .bind(&config.bind_addr)?
