@@ -287,6 +287,7 @@ async fn index_block(
     
     let prev_hash = hex::encode(&block.header.prev_hash.0);
     
+    let tx: &mut sqlx::Transaction<'_, Postgres> = &mut *tx;
     sqlx::query(
         r#"
         INSERT INTO blocks (block_hash, height, prev_hash, timestamp)
@@ -298,7 +299,7 @@ async fn index_block(
     .bind(height)
     .bind(&prev_hash)
     .bind(block.header.timestamp as i64)
-    .execute(&mut *tx)
+    .execute(tx)
     .await?;
     
     Ok(())
