@@ -299,7 +299,7 @@ async fn index_block(
     .bind(height)
     .bind(&prev_hash)
     .bind(block.header.timestamp as i64)
-    .execute(tx)
+    .execute(&mut *tx)
     .await?;
     
     Ok(())
