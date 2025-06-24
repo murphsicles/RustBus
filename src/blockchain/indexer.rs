@@ -12,11 +12,12 @@ use log::{info, warn, error};
 use rayon::prelude::*;
 use backoff::{ExponentialBackoff, future::retry};
 use std::time::{Duration, Instant};
+use std::sync::Arc;
 
 const ZMQ_RECONNECT_DELAY: u64 = 5;
 const BATCH_SIZE: usize = 1000;
 
-pub async fn index_blocks(config: Config, pool: Pool<Postgres>, state: std::sync::Arc<AppState>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub async fn index_blocks(config: Config, pool: Pool<Postgres>, state: Arc<AppState>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut fetcher = BlockFetcher::new(&config.rpc_url, &config.rpc_user, &config.rpc_password, config.network)?;
     let classifier = TransactionClassifier::new();
     let _latest_height = sync_historical_blocks(&config, &pool, &mut fetcher, &classifier, &state).await?;
@@ -31,13 +32,10 @@ pub async fn index_blocks(config: Config, pool: Pool<Postgres>, state: std::sync
         let subscriber = zmq_context.socket(zmq::SUB).expect("Failed to create ZMQ socket");
         
         let zmq_addr = config.zmq_addr.clone();
-        let result: Result<(), backoff::Error<zmq::Error>> = retry(backoff.clone(), || {
-            let subscriber_ref = &subscriber;
-            async {
-                subscriber_ref.connect(&zmq_addr).map_err(|e| backoff::Error::transient(e))?;
-                subscriber_ref.set_subscribe(b"hashblock").map_err(|e| backoff::Error::transient(e))?;
-                Ok(())
-            }
+        let result: Result<(), backoff::Error<zmq::Error>> = retry(backoff.clone(), || async {
+            subscriber.connect(&zmq_addr).map_err(backoff::Error::transient)?;
+            subscriber.set_subscribe(b"hashblock").map_err(backoff::Error::transient)?;
+            Ok(())
         }).await;
 
         if result.is_err() {
@@ -87,9 +85,9 @@ async fn process_new_block(
 ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
     let mut db_tx = pool.begin().await?;
     
-    let (block, height) = fetcher.fetch_block(block_hash)?;
+    let (block, height) = fetcher.fetch_block(block_hash).await?;
     
-    handle_reorg(&pool, fetcher, &block, height, &mut db_tx).await?;
+    handle_reorg(pool, fetcher, &block, height, &mut db_tx).await?;
     let tx_count = process_block_transactions(&mut db_tx, &block, height, classifier).await?;
     index_block(&mut db_tx, &block, height).await?;
 
@@ -106,22 +104,22 @@ async fn sync_historical_blocks(
     pool: &Pool<Postgres>,
     fetcher: &mut BlockFetcher,
     classifier: &TransactionClassifier,
-    _state: &std::sync::Arc<AppState>,
+    _state: &Arc<AppState>,
 ) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
     let latest_height: Option<i64> = sqlx::query_scalar("SELECT MAX(height) FROM blocks")
         .fetch_one(pool)
         .await?;
     let start_height = latest_height.map(|h| h + 1).unwrap_or(config.start_height);
-    let tip_height = fetcher.get_best_block_height().unwrap_or(start_height);
+    let tip_height = fetcher.get_best_block_height().await.unwrap_or(start_height);
 
     info!("Syncing historical blocks from {} to {}", start_height, tip_height);
 
     for height in start_height..=tip_height {
-        let block_hash = fetcher.get_block_hash(height)?;
-        let (block, height) = fetcher.fetch_block(&block_hash)?;
+        let block_hash = fetcher.get_block_hash(height).await?;
+        let (block, height) = fetcher.fetch_block(&block_hash).await?;
         let mut db_tx = pool.begin().await?;
 
-        handle_reorg(&pool, fetcher, &block, height, &mut db_tx).await?;
+        handle_reorg(pool, fetcher, &block, height, &mut db_tx).await?;
         let tx_count = process_block_transactions(&mut db_tx, &block, height, classifier).await?;
         index_block(&mut db_tx, &block, height).await?;
 
@@ -207,12 +205,11 @@ pub async fn handle_reorg(
     new_height: i64,
     tx: &mut PgTransaction<'_>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let tx: &mut sqlx::Transaction<'_, Postgres> = &mut *tx;
     let prev_block: Option<BlockHeader> = sqlx::query_as(
         "SELECT block_hash, height, prev_hash FROM blocks WHERE height = $1"
     )
     .bind(new_height - 1)
-    .fetch_optional(tx)
+    .fetch_optional(&mut *tx)
     .await?;
 
     if let Some(prev) = prev_block {
@@ -259,7 +256,7 @@ async fn find_fork_point(
         .await?;
         
         if let Some(our_hash) = our_hash {
-            let canonical_hash = fetcher.get_block_hash(height)?;
+            let canonical_hash = fetcher.get_block_hash(height).await?;
             
             if our_hash == canonical_hash {
                 return Ok(height);
