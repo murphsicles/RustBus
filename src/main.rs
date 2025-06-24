@@ -8,26 +8,30 @@ use rustbus::database::schema::init_db;
 use rustbus::metrics::metrics;
 use log::{error, info};
 use sqlx::postgres::PgPoolOptions;
-use std::env;
+use std::sync::Arc;
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     dotenvy::dotenv().ok();
     env_logger::init();
 
-    let config = Config::from_env()?;
+    let config = Config::from_env().map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
     let pool = PgPoolOptions::new()
         .max_connections(10)
         .connect(&config.db_url)
         .await
-        .expect("Failed to connect to database");
-    init_db(&pool, config.start_height + 1_000_000).await?;
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    init_db(&pool, config.start_height + 1_000_000)
+        .await
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
-    let state = rustbus::AppState::new(pool, &config).await?;
+    let state = rustbus::AppState::new(pool.clone(), &config)
+        .await
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
     let index_config = config.clone();
-    let index_state = state.clone();
+    let index_state = Arc::new(state.clone());
     tokio::spawn(async move {
-        if let Err(e) = index_blocks(index_config, index_state).await {
+        if let Err(e) = index_blocks(index_config, pool, index_state).await {
             error!("Index blocks task failed: {}", e);
         }
     });
@@ -38,9 +42,9 @@ async fn main() -> std::io::Result<()> {
             App::new()
                 .route("/metrics", web::get().to(metrics))
         })
-        .bind(("0.0.0.0", metrics_config.metrics_port))
+        .bind(("0.0.0.0", metrics_config.metrics_port))?
+        .run()
         .await
-        .and_then(|server| server.run())
         {
             error!("Metrics server failed: {}", e);
         }
@@ -53,7 +57,11 @@ async fn main() -> std::io::Result<()> {
             .route("/ws", web::get().to(ws_route))
             .service(get_tx)
             .service(list_txs)
-            .service(web::resource("/graphql").route(web::post().to(graphql)).route(web::get().to(graphiql)))
+            .service(
+                web::resource("/graphql")
+                    .route(web::post().to(graphql))
+                    .route(web::get().to(graphiql))
+            )
     })
     .bind(&config.bind_addr)?
     .run()
