@@ -10,6 +10,7 @@ use log::{error, info};
 use sqlx::postgres::PgPoolOptions;
 use std::sync::Arc;
 use async_graphql_actix_web::{GraphQLRequest, GraphQLResponse};
+use actix_web::HttpRequest;
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
@@ -73,7 +74,7 @@ async fn main() -> std::io::Result<()> {
                         let schema = state.schema.clone();
                         GraphQLResponse::from(schema.execute(req.into_inner()).await)
                     }))
-                    .route(web::get().to(graphiql)),
+                    .route(web::get().to(|_req: HttpRequest| async move { graphiql().await })),
             )
     })
     .bind(&config.bind_addr)?
