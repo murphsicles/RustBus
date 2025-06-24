@@ -19,7 +19,7 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub async fn new(pool: PgPool, _config: &super::config::Config) -> Result<Self, Box<dyn std::error::Error>> {
+    pub async fn new(pool: PgPool, _config: &super::config::Config) -> Result<Self, Box<dyn std::error::Error + Send + Sync + 'static>> {
         let schema = Schema::build(QueryRoot, EmptyMutation, EmptySubscription)
             .data(pool.clone())
             .finish();
