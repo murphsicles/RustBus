@@ -1,6 +1,6 @@
 use actix_web::{web, App, HttpServer};
 use rustbus::config::Config;
-use rustbus::graphql::{graphql, graphiql};
+use rustbus::graphql::graphiql;
 use rustbus::rest::routes::{get_tx, list_txs};
 use rustbus::websocket::route::ws_route;
 use rustbus::blockchain::indexer::index_blocks;
@@ -9,13 +9,14 @@ use rustbus::metrics::metrics;
 use log::{error, info};
 use sqlx::postgres::PgPoolOptions;
 use std::sync::Arc;
+use async_graphql_actix_web::{GraphQLRequest, GraphQLResponse};
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     dotenvy::dotenv().ok();
     env_logger::init();
 
-    let config = Config::from_env().map_err(|e: Box<dyn std::error::Error>| {
+    let config = Config::from_env().map_err(|e: Box<dyn std::error::Error + Send + Sync + 'static>| {
         std::io::Error::new(std::io::ErrorKind::Other, e)
     })?;
     let pool = PgPoolOptions::new()
@@ -29,7 +30,7 @@ async fn main() -> std::io::Result<()> {
 
     let state = rustbus::AppState::new(pool.clone(), &config)
         .await
-        .map_err(|e: Box<dyn std::error::Error>| {
+        .map_err(|e: Box<dyn std::error::Error + Send + Sync + 'static>| {
             std::io::Error::new(std::io::ErrorKind::Other, e)
         })?;
     let index_config = config.clone();
@@ -68,10 +69,11 @@ async fn main() -> std::io::Result<()> {
             .service(
                 web::resource("/graphql")
                     .app_data(state_data.clone())
-                    .route(web::post().to(move |req, data| {
-                        graphql(data, req) // Wrap graphql to pass state.schema
+                    .route(web::post().to(|state: web::Data<rustbus::AppState>, req: GraphQLRequest| async move {
+                        let schema = state.schema.clone();
+                        GraphQLResponse::from(schema.execute(req.into_inner()).await)
                     }))
-                    .route(web::get().to(graphiql)),
+                    .route(web::get().to(|| async { graphiql().await })),
             )
     })
     .bind(&config.bind_addr)?
