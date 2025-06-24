@@ -73,7 +73,7 @@ async fn main() -> std::io::Result<()> {
                         let schema = state.schema.clone();
                         GraphQLResponse::from(schema.execute(req.into_inner()).await)
                     }))
-                    .route(web::get().to(|| async { graphiql() })),
+                    .route(web::get().to(graphiql)),
             )
     })
     .bind(&config.bind_addr)?
