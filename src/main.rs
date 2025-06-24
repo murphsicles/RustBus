@@ -16,7 +16,7 @@ async fn main() -> std::io::Result<()> {
     dotenvy::dotenv().ok();
     env_logger::init();
 
-    let config = Config::from_env().map_err(|e: Box<dyn std::error::Error + Send + Sync + 'static>| {
+    let config = Config::from_env().map_err(|e| {
         std::io::Error::new(std::io::ErrorKind::Other, e)
     })?;
     let pool = PgPoolOptions::new()
@@ -30,7 +30,7 @@ async fn main() -> std::io::Result<()> {
 
     let state = rustbus::AppState::new(pool.clone(), &config)
         .await
-        .map_err(|e: Box<dyn std::error::Error + Send + Sync + 'static>| {
+        .map_err(|e| {
             std::io::Error::new(std::io::ErrorKind::Other, e)
         })?;
     let index_config = config.clone();
@@ -73,7 +73,7 @@ async fn main() -> std::io::Result<()> {
                         let schema = state.schema.clone();
                         GraphQLResponse::from(schema.execute(req.into_inner()).await)
                     }))
-                    .route(web::get().to(|| async { graphiql().await })),
+                    .route(web::get().to(|| async { graphiql() })),
             )
     })
     .bind(&config.bind_addr)?
