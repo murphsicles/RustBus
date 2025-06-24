@@ -16,7 +16,7 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn from_env() -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn from_env() -> Result<Self, Box<dyn std::error::Error + Send + Sync + 'static>> {
         let config = Config {
             db_url: env::var("DATABASE_URL").map_err(|_| "DATABASE_URL must be set")?,
             bsv_node: env::var("BSV_NODE").unwrap_or("127.0.0.1:8333".to_string()),
