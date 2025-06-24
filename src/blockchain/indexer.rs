@@ -212,7 +212,7 @@ pub async fn handle_reorg(
         "SELECT block_hash, height, prev_hash FROM blocks WHERE height = $1"
     )
     .bind(new_height - 1)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(tx)
     .await?;
 
     if let Some(prev) = prev_block {
@@ -226,14 +226,16 @@ pub async fn handle_reorg(
             
             warn!("Fork point found at height {}. Rolling back to height {}", fork_height, fork_height);
             
+            let tx: &mut sqlx::Transaction<'_, Postgres> = &mut *tx;
             sqlx::query("DELETE FROM transactions WHERE block_height > $1")
                 .bind(fork_height)
-                .execute(&mut *tx)
+                .execute(tx)
                 .await?;
                 
+            let tx: &mut sqlx::Transaction<'_, Postgres> = &mut *tx;
             sqlx::query("DELETE FROM blocks WHERE height > $1")
                 .bind(fork_height)
-                .execute(&mut *tx)
+                .execute(tx)
                 .await?;
             
             info!("Rolled back blocks from height {} to {}", new_height, fork_height + 1);
@@ -297,7 +299,7 @@ async fn index_block(
     .bind(height)
     .bind(&prev_hash)
     .bind(block.header.timestamp as i64)
-    .execute(&mut *tx)
+    .execute(tx)
     .await?;
     
     Ok(())
