@@ -1,6 +1,7 @@
 use actix_web::{web, App, HttpServer};
 use rustbus::config::Config;
-use rustbus::graphql::routes::graphiql; // Updated import
+#[allow(unused_imports)] // Suppress unused import warning
+use rustbus::graphql::routes::graphiql;
 use rustbus::rest::routes::{get_tx, list_txs};
 use rustbus::websocket::route::ws_route;
 use rustbus::blockchain::indexer::index_blocks;
@@ -10,7 +11,6 @@ use log::{error, info};
 use sqlx::postgres::PgPoolOptions;
 use std::sync::Arc;
 use async_graphql_actix_web::{GraphQLRequest, GraphQLResponse};
-use actix_web::HttpRequest;
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
@@ -74,7 +74,7 @@ async fn main() -> std::io::Result<()> {
                         let schema = state.schema.clone();
                         GraphQLResponse::from(schema.execute(req.into_inner()).await)
                     }))
-                    .route(web::get().to(|_req: HttpRequest| async move { rustbus::graphql::routes::graphiql().await })),
+                    .route(web::get().to(rustbus::graphql::routes::graphiql)),
             )
     })
     .bind(&config.bind_addr)?
