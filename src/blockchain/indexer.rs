@@ -85,7 +85,7 @@ async fn process_new_block(
 ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
     let mut db_tx = pool.begin().await?;
     
-    let (block, height) = fetcher.fetch_block(block_hash).await?;
+    let (block, height) = fetcher.fetch_block(block_hash)?;
     
     handle_reorg(pool, fetcher, &block, height, &mut db_tx).await?;
     let tx_count = process_block_transactions(&mut db_tx, &block, height, classifier).await?;
@@ -110,13 +110,13 @@ async fn sync_historical_blocks(
         .fetch_one(pool)
         .await?;
     let start_height = latest_height.map(|h| h + 1).unwrap_or(config.start_height);
-    let tip_height = fetcher.get_best_block_height().await.unwrap_or(start_height);
+    let tip_height = fetcher.get_best_block_height().unwrap_or(start_height);
 
     info!("Syncing historical blocks from {} to {}", start_height, tip_height);
 
     for height in start_height..=tip_height {
-        let block_hash = fetcher.get_block_hash(height).await?;
-        let (block, height) = fetcher.fetch_block(&block_hash).await?;
+        let block_hash = fetcher.get_block_hash(height)?;
+        let (block, height) = fetcher.fetch_block(&block_hash)?;
         let mut db_tx = pool.begin().await?;
 
         handle_reorg(pool, fetcher, &block, height, &mut db_tx).await?;
@@ -190,7 +190,7 @@ async fn insert_transaction_batch(
     
     query.push(" ON CONFLICT (txid) DO NOTHING");
     
-    query.build().execute(&mut *db_tx).await.map_err(|e| {
+    query.build().execute(db_tx).await.map_err(|e| {
         error!("Failed to insert transaction batch of {} transactions: {}", batch.len(), e);
         e
     })?;
@@ -209,7 +209,7 @@ pub async fn handle_reorg(
         "SELECT block_hash, height, prev_hash FROM blocks WHERE height = $1"
     )
     .bind(new_height - 1)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(tx)
     .await?;
 
     if let Some(prev) = prev_block {
@@ -225,12 +225,12 @@ pub async fn handle_reorg(
             
             sqlx::query("DELETE FROM transactions WHERE block_height > $1")
                 .bind(fork_height)
-                .execute(&mut *tx)
+                .execute(tx)
                 .await?;
                 
             sqlx::query("DELETE FROM blocks WHERE height > $1")
                 .bind(fork_height)
-                .execute(&mut *tx)
+                .execute(tx)
                 .await?;
             
             info!("Rolled back blocks from height {} to {}", new_height, fork_height + 1);
@@ -256,7 +256,7 @@ async fn find_fork_point(
         .await?;
         
         if let Some(our_hash) = our_hash {
-            let canonical_hash = fetcher.get_block_hash(height).await?;
+            let canonical_hash = fetcher.get_block_hash(height)?;
             
             if our_hash == canonical_hash {
                 return Ok(height);
@@ -293,7 +293,7 @@ async fn index_block(
     .bind(height)
     .bind(&prev_hash)
     .bind(block.header.timestamp as i64)
-    .execute(&mut *tx)
+    .execute(tx)
     .await?;
     
     Ok(())
