@@ -11,7 +11,7 @@ use std::sync::Arc;
 use async_graphql_actix_web::{GraphQLRequest, GraphQLResponse};
 use actix_web::HttpResponse;
 use async_graphql::http::{playground_source, GraphQLPlaygroundConfig};
-use tokio::select;
+use tokio::try_join;
 
 async fn graphiql_handler() -> HttpResponse {
     HttpResponse::Ok()
@@ -77,23 +77,21 @@ async fn main() -> std::io::Result<()> {
     info!("Starting HTTP server at {}", config.bind_addr);
     info!("Starting metrics server at 0.0.0.0:{}", metrics_config.metrics_port);
 
-    select! {
-        result = main_server.run() => {
-            if let Err(e) = result {
-                error!("Main server failed: {}", e);
-                return Err(e);
-            }
+    try_join!(
+        async {
+            main_server.run().await?;
+            Ok(())
+        },
+        async {
+            metrics_server.run().await?;
+            Ok(())
         }
-        result = metrics_server.run() => {
-            if let Err(e) = result {
-                error!("Metrics server failed: {}", e);
-                return Err(e);
-            }
-        }
-        _ = indexer_task => {
-            error!("Indexer task completed unexpectedly");
-        }
-    }
+    )?;
+
+    indexer_task.await.map_err(|e| {
+        error!("Indexer task failed: {}", e);
+        std::io::Error::new(std::io::ErrorKind::Other, e)
+    })?;
 
     Ok(())
 }
