@@ -51,11 +51,15 @@ Launch `RustBus` in minutes with Docker, PostgreSQL, and a BSV node.
    - Edit `.env` with your settings:
      ```bash
      DATABASE_URL=postgres://user:pass@localhost:5432/rustbus
-     BSV_NODE=127.0.0.1:8332
+     DATABASE_URL=postgres://user:pass@localhost:5432/rustbus
+     BSV_RPC_URL=http://127.0.0.1:8332
+     BSV_RPC_USER=rpcuser
+     BSV_RPC_PASSWORD=rpcpass
      ZMQ_ADDR=tcp://127.0.0.1:28332
      NETWORK=mainnet
      START_HEIGHT=800000
-     METRICS_PORT=8080
+     METRICS_PORT=9090
+     BIND_ADDR=0.0.0.0:8080
      ```
 
 4. **Set Up PostgreSQL**:
