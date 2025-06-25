@@ -29,7 +29,7 @@ pub async fn index_blocks(config: Config, pool: Pool<Postgres>, state: Arc<AppSt
     let zmq_context = zmq::Context::new();
 
     loop {
-        let result: Result<(), backoff::Error<zmq::Error>> = retry(backoff.clone(), || async {
+        let result: Result<zmq::Socket, backoff::Error<zmq::Error>> = retry(backoff.clone(), || async {
             let subscriber = zmq_context.socket(zmq::SUB).map_err(backoff::Error::transient)?;
             subscriber.connect(&config.zmq_addr).map_err(backoff::Error::transient)?;
             subscriber.set_subscribe(b"hashblock").map_err(backoff::Error::transient)?;
