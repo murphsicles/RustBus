@@ -11,6 +11,7 @@ use std::sync::Arc;
 use async_graphql_actix_web::{GraphQLRequest, GraphQLResponse};
 use actix_web::HttpResponse;
 use async_graphql::http::{playground_source, GraphQLPlaygroundConfig};
+use tokio::select;
 
 async fn graphiql_handler() -> HttpResponse {
     HttpResponse::Ok()
@@ -42,28 +43,19 @@ async fn main() -> std::io::Result<()> {
         })?;
     let index_config = config.clone();
     let index_state = Arc::new(state.clone());
-    tokio::spawn(async move {
+    let indexer_task = tokio::spawn(async move {
         if let Err(e) = index_blocks(index_config, pool, index_state).await {
             error!("Index blocks task failed: {}", e);
         }
     });
 
     let metrics_config = config.clone();
-    tokio::spawn(async move {
-        HttpServer::new(|| {
-            App::new().route("/metrics", web::get().to(metrics))
-        })
-        .bind(("0.0.0.0", metrics_config.metrics_port))?
-        .run()
-        .await
-        .map_err(|e| {
-            error!("Metrics server failed: {}", e);
-            e
-        })
-    });
+    let metrics_server = HttpServer::new(|| {
+        App::new().route("/metrics", web::get().to(metrics))
+    })
+    .bind(("0.0.0.0", metrics_config.metrics_port))?;
 
-    info!("Starting HTTP server at {}", config.bind_addr);
-    HttpServer::new(move || {
+    let main_server = HttpServer::new(move || {
         let state_data = web::Data::new(state.clone());
         App::new()
             .app_data(state_data.clone())
@@ -80,7 +72,28 @@ async fn main() -> std::io::Result<()> {
                     .route(web::get().to(graphiql_handler)),
             )
     })
-    .bind(&config.bind_addr)?
-    .run()
-    .await
+    .bind(&config.bind_addr)?;
+
+    info!("Starting HTTP server at {}", config.bind_addr);
+    info!("Starting metrics server at 0.0.0.0:{}", metrics_config.metrics_port);
+
+    select! {
+        result = main_server.run() => {
+            if let Err(e) = result {
+                error!("Main server failed: {}", e);
+                return Err(e);
+            }
+        }
+        result = metrics_server.run() => {
+            if let Err(e) = result {
+                error!("Metrics server failed: {}", e);
+                return Err(e);
+            }
+        }
+        _ = indexer_task => {
+            error!("Indexer task completed unexpectedly");
+        }
+    }
+
+    Ok(())
 }
