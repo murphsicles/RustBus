@@ -1,4 +1,4 @@
-use actix_web::{web, App, HttpServer, HttpResponse};
+use actix_web::{web, App, HttpServer};
 use rustbus::config::Config;
 use rustbus::graphql::routes::graphiql;
 use rustbus::rest::routes::{get_tx, list_txs};
@@ -11,7 +11,6 @@ use sqlx::postgres::PgPoolOptions;
 use std::sync::Arc;
 use async_graphql_actix_web::{GraphQLRequest, GraphQLResponse};
 use actix_web::HttpRequest;
-use actix_rt::System;
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
@@ -44,23 +43,17 @@ async fn main() -> std::io::Result<()> {
     });
 
     let metrics_config = config.clone();
-    std::thread::spawn(move || {
-        let sys = System::new();
-        sys.block_on(async {
-            let server = HttpServer::new(|| {
-                App::new().route("/metrics", web::get().to(metrics))
-            })
-            .bind(("0.0.0.0", metrics_config.metrics_port))
-            .map_err(|e| {
-                error!("Metrics server bind failed: {}", e);
-                e
-            });
-            if let Ok(server) = server {
-                if let Err(e) = server.run().await {
-                    error!("Metrics server failed: {}", e);
-                }
-            }
-        });
+    tokio::spawn(async move {
+        HttpServer::new(|| {
+            App::new().route("/metrics", web::get().to(metrics))
+        })
+        .bind(("0.0.0.0", metrics_config.metrics_port))?
+        .run()
+        .await
+        .map_err(|e| {
+            error!("Metrics server failed: {}", e);
+            e
+        })
     });
 
     info!("Starting HTTP server at {}", config.bind_addr);
@@ -78,7 +71,7 @@ async fn main() -> std::io::Result<()> {
                         let schema = state.schema.clone();
                         GraphQLResponse::from(schema.execute(req.into_inner()).await)
                     }))
-                    .route(web::get().to(|_req: HttpRequest| async move { graphiql().await })),
+                    .route(web::get().to(|_req: HttpRequest| async move { rustbus::graphql::routes::graphiql().await })),
             )
     })
     .bind(&config.bind_addr)?
