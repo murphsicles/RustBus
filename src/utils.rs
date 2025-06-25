@@ -1,4 +1,5 @@
 use sv::messages::Tx;
+use sv::util::Serializable; // Import Serializable trait for write method
 
 // Extracts OP_RETURN data from a transaction, if present
 pub fn extract_op_return(tx: &Tx) -> Option<String> {
@@ -24,7 +25,7 @@ impl TxExt for Tx {
     // Encodes the transaction to hex using serialization
     fn to_hex(&self) -> String {
         let mut bytes = Vec::new();
-        self.write(&mut bytes).unwrap(); // Serialize transaction
+        self.write(&mut bytes).unwrap(); // Serialize transaction to bytes
         hex::encode(bytes) // Return hex string
     }
 }
