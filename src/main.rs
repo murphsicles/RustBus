@@ -80,11 +80,11 @@ async fn main() -> std::io::Result<()> {
     try_join!(
         async {
             main_server.run().await?;
-            Ok(())
+            Ok::<(), std::io::Error>(())
         },
         async {
             metrics_server.run().await?;
-            Ok(())
+            Ok::<(), std::io::Error>(())
         }
     )?;
 
