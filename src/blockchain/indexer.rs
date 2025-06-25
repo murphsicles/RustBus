@@ -22,19 +22,43 @@ pub async fn index_blocks(config: Config, pool: Pool<Postgres>, state: Arc<AppSt
     let classifier = TransactionClassifier::new();
     let _latest_height = sync_historical_blocks(&config, &pool, &mut fetcher, &classifier, &state).await?;
 
-    let zmq_context = zmq::Context::new();
     let backoff = ExponentialBackoff {
         max_elapsed_time: Some(Duration::from_secs(3600)),
         ..Default::default()
     };
 
     loop {
-        let subscriber = zmq_context.socket(zmq::SUB).expect("Failed to create ZMQ socket");
-        
-        let zmq_addr = config.zmq_addr.clone();
+        let zmq_context = zmq::Context::new();
         let result: Result<(), backoff::Error<zmq::Error>> = retry(backoff.clone(), || async {
-            subscriber.connect(&zmq_addr).map_err(backoff::Error::transient)?;
+            let subscriber = zmq_context.socket(zmq::SUB).map_err(backoff::Error::transient)?;
+            subscriber.connect(&config.zmq_addr).map_err(backoff::Error::transient)?;
             subscriber.set_subscribe(b"hashblock").map_err(backoff::Error::transient)?;
+            while let Ok(parts) = subscriber.recv_multipart(0) {
+                if parts.len() < 2 || parts[0] != b"hashblock" {
+                    continue;
+                }
+
+                let start_time = Instant::now();
+                let block_hash = hex::encode(&parts[1]);
+                
+                match process_new_block(&pool, &mut fetcher, &classifier, &block_hash).await {
+                    Ok(tx_count) => {
+                        let elapsed = start_time.elapsed();
+                        BLOCK_PROCESS_TIME.observe(elapsed.as_secs_f64());
+                        info!(
+                            "Indexed block {} with {} transactions in {:.2}s",
+                            block_hash,
+                            tx_count,
+                            elapsed.as_secs_f64()
+                        );
+                    }
+                    Err(e) => {
+                        warn!("Error processing block {}: {}. Retrying...", block_hash, e);
+                        tokio::time::sleep(Duration::from_secs(ZMQ_RECONNECT_DELAY)).await;
+                        continue;
+                    }
+                }
+            }
             Ok(())
         }).await;
 
@@ -43,40 +67,12 @@ pub async fn index_blocks(config: Config, pool: Pool<Postgres>, state: Arc<AppSt
             return Err("ZMQ connection failed".into());
         }
 
-        info!("Listening for ZMQ block notifications at {}", config.zmq_addr);
-
-        while let Ok(parts) = subscriber.recv_multipart(0) {
-            if parts.len() < 2 || parts[0] != b"hashblock" {
-                continue;
-            }
-
-            let start_time = Instant::now();
-            let block_hash = hex::encode(&parts[1]);
-            
-            match process_new_block(&pool, &mut fetcher, &classifier, &block_hash).await {
-                Ok(tx_count) => {
-                    let elapsed = start_time.elapsed();
-                    BLOCK_PROCESS_TIME.observe(elapsed.as_secs_f64());
-                    info!(
-                        "Indexed block {} with {} transactions in {:.2}s",
-                        block_hash,
-                        tx_count,
-                        elapsed.as_secs_f64()
-                    );
-                }
-                Err(e) => {
-                    warn!("Error processing block {}: {}. Retrying...", block_hash, e);
-                    tokio::time::sleep(Duration::from_secs(ZMQ_RECONNECT_DELAY)).await;
-                    continue;
-                }
-            }
-        }
-
         warn!("ZMQ connection lost. Reconnecting...");
         tokio::time::sleep(Duration::from_secs(ZMQ_RECONNECT_DELAY)).await;
     }
 }
 
+// Rest of the file remains unchanged
 async fn process_new_block(
     pool: &Pool<Postgres>,
     fetcher: &mut BlockFetcher,
