@@ -26,45 +26,51 @@ pub async fn index_blocks(config: Config, pool: Pool<Postgres>, state: Arc<AppSt
         max_elapsed_time: Some(Duration::from_secs(3600)),
         ..Default::default()
     };
+    let zmq_context = zmq::Context::new();
 
     loop {
-        let zmq_context = zmq::Context::new();
         let result: Result<(), backoff::Error<zmq::Error>> = retry(backoff.clone(), || async {
             let subscriber = zmq_context.socket(zmq::SUB).map_err(backoff::Error::transient)?;
             subscriber.connect(&config.zmq_addr).map_err(backoff::Error::transient)?;
             subscriber.set_subscribe(b"hashblock").map_err(backoff::Error::transient)?;
-            while let Ok(parts) = subscriber.recv_multipart(0) {
-                if parts.len() < 2 || parts[0] != b"hashblock" {
-                    continue;
-                }
-
-                let start_time = Instant::now();
-                let block_hash = hex::encode(&parts[1]);
-                
-                match process_new_block(&pool, &mut fetcher, &classifier, &block_hash).await {
-                    Ok(tx_count) => {
-                        let elapsed = start_time.elapsed();
-                        BLOCK_PROCESS_TIME.observe(elapsed.as_secs_f64());
-                        info!(
-                            "Indexed block {} with {} transactions in {:.2}s",
-                            block_hash,
-                            tx_count,
-                            elapsed.as_secs_f64()
-                        );
-                    }
-                    Err(e) => {
-                        warn!("Error processing block {}: {}. Retrying...", block_hash, e);
-                        tokio::time::sleep(Duration::from_secs(ZMQ_RECONNECT_DELAY)).await;
-                        continue;
-                    }
-                }
-            }
-            Ok(())
+            Ok(subscriber)
         }).await;
 
-        if result.is_err() {
-            warn!("Failed to reconnect to ZMQ after retries. Exiting...");
-            return Err("ZMQ connection failed".into());
+        let subscriber = match result {
+            Ok(sub) => sub,
+            Err(_) => {
+                warn!("Failed to reconnect to ZMQ after retries. Exiting...");
+                return Err("ZMQ connection failed".into());
+            }
+        };
+
+        info!("Listening for ZMQ block notifications at {}", config.zmq_addr);
+
+        while let Ok(parts) = subscriber.recv_multipart(0) {
+            if parts.len() < 2 || parts[0] != b"hashblock" {
+                continue;
+            }
+
+            let start_time = Instant::now();
+            let block_hash = hex::encode(&parts[1]);
+            
+            match process_new_block(&pool, &mut fetcher, &classifier, &block_hash).await {
+                Ok(tx_count) => {
+                    let elapsed = start_time.elapsed();
+                    BLOCK_PROCESS_TIME.observe(elapsed.as_secs_f64());
+                    info!(
+                        "Indexed block {} with {} transactions in {:.2}s",
+                        block_hash,
+                        tx_count,
+                        elapsed.as_secs_f64()
+                    );
+                }
+                Err(e) => {
+                    warn!("Error processing block {}: {}. Retrying...", block_hash, e);
+                    tokio::time::sleep(Duration::from_secs(ZMQ_RECONNECT_DELAY)).await;
+                    break; // Break to reconnect
+                }
+            }
         }
 
         warn!("ZMQ connection lost. Reconnecting...");
@@ -186,7 +192,6 @@ async fn insert_transaction_batch(
     
     query.push(" ON CONFLICT (txid) DO NOTHING");
     
-    // Fixed: Use &mut **db_tx to get the underlying connection
     query.build().execute(&mut **db_tx).await.map_err(|e| {
         error!("Failed to insert transaction batch of {} transactions: {}", batch.len(), e);
         e
@@ -202,7 +207,6 @@ pub async fn handle_reorg(
     new_height: i64,
     tx: &mut PgTransaction<'_>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Fixed: Use &mut **tx to get the underlying connection
     let prev_block: Option<BlockHeader> = sqlx::query_as(
         "SELECT block_hash, height, prev_hash FROM blocks WHERE height = $1"
     )
@@ -221,13 +225,11 @@ pub async fn handle_reorg(
             
             warn!("Fork point found at height {}. Rolling back to height {}", fork_height, fork_height);
             
-            // Fixed: Use &mut **tx to get the underlying connection
             sqlx::query("DELETE FROM transactions WHERE block_height > $1")
                 .bind(fork_height)
                 .execute(&mut **tx)
                 .await?;
                 
-            // Fixed: Use &mut **tx to get the underlying connection
             sqlx::query("DELETE FROM blocks WHERE height > $1")
                 .bind(fork_height)
                 .execute(&mut **tx)
@@ -282,7 +284,6 @@ async fn index_block(
     
     let prev_hash = hex::encode(&block.header.prev_hash.0);
     
-    // Fixed: Use &mut **tx to get the underlying connection
     sqlx::query(
         r#"
         INSERT INTO blocks (block_hash, height, prev_hash, timestamp)
