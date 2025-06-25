@@ -1,5 +1,6 @@
 use actix_web::{web, App, HttpServer, HttpResponse};
 use rustbus::config::Config;
+use rustbus::graphql::routes::graphiql;
 use rustbus::rest::routes::{get_tx, list_txs};
 use rustbus::websocket::route::ws_route;
 use rustbus::blockchain::indexer::index_blocks;
@@ -9,13 +10,8 @@ use log::{error, info};
 use sqlx::postgres::PgPoolOptions;
 use std::sync::Arc;
 use async_graphql_actix_web::{GraphQLRequest, GraphQLResponse};
-use async_graphql::http::{playground_source, GraphQLPlaygroundConfig};
-
-async fn graphiql_handler() -> HttpResponse {
-    HttpResponse::Ok()
-        .content_type("text/html; charset=utf-8")
-        .body(playground_source(GraphQLPlaygroundConfig::new("/graphql")))
-}
+use actix_web::HttpRequest;
+use actix_rt::System;
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
@@ -48,20 +44,23 @@ async fn main() -> std::io::Result<()> {
     });
 
     let metrics_config = config.clone();
-    tokio::spawn(async move {
-        let server = HttpServer::new(|| {
-            App::new().route("/metrics", web::get().to(metrics))
-        })
-        .bind(("0.0.0.0", metrics_config.metrics_port))
-        .map_err(|e| {
-            error!("Metrics server bind failed: {}", e);
-            e
-        });
-        if let Ok(server) = server {
-            if let Err(e) = server.run().await {
-                error!("Metrics server failed: {}", e);
+    std::thread::spawn(move || {
+        let sys = System::new();
+        sys.block_on(async {
+            let server = HttpServer::new(|| {
+                App::new().route("/metrics", web::get().to(metrics))
+            })
+            .bind(("0.0.0.0", metrics_config.metrics_port))
+            .map_err(|e| {
+                error!("Metrics server bind failed: {}", e);
+                e
+            });
+            if let Ok(server) = server {
+                if let Err(e) = server.run().await {
+                    error!("Metrics server failed: {}", e);
+                }
             }
-        }
+        });
     });
 
     info!("Starting HTTP server at {}", config.bind_addr);
@@ -79,7 +78,7 @@ async fn main() -> std::io::Result<()> {
                         let schema = state.schema.clone();
                         GraphQLResponse::from(schema.execute(req.into_inner()).await)
                     }))
-                    .route(web::get().to(graphiql_handler)),
+                    .route(web::get().to(|_req: HttpRequest| async move { graphiql().await })),
             )
     })
     .bind(&config.bind_addr)?
