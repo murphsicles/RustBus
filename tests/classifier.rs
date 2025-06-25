@@ -14,7 +14,7 @@ mod tests {
         let data = b"run://test";
         let mut script = Script::new();
         script.append(OP_RETURN); // 0x6a
-        script.append_data(data); // Pushdata opcodes + data
+        script.append_slice(data); // Raw data: run://test
         tx.outputs.push(TxOut { satoshis: 0, lock_script: script });
         assert_eq!(classifier.classify(&tx), "RUN");
     }
