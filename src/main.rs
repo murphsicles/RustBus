@@ -1,6 +1,5 @@
 use actix_web::{web, App, HttpServer};
 use rustbus::config::Config;
-use rustbus::graphql::routes::graphiql;
 use rustbus::rest::routes::{get_tx, list_txs};
 use rustbus::websocket::route::ws_route;
 use rustbus::blockchain::indexer::index_blocks;
@@ -10,7 +9,14 @@ use log::{error, info};
 use sqlx::postgres::PgPoolOptions;
 use std::sync::Arc;
 use async_graphql_actix_web::{GraphQLRequest, GraphQLResponse};
-use actix_web::HttpRequest;
+use actix_web::HttpResponse;
+use async_graphql::http::{playground_source, GraphQLPlaygroundConfig};
+
+async fn graphiql_handler() -> HttpResponse {
+    HttpResponse::Ok()
+        .content_type("text/html; charset=utf-8")
+        .body(playground_source(GraphQLPlaygroundConfig::new("/graphql")))
+}
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
@@ -71,7 +77,7 @@ async fn main() -> std::io::Result<()> {
                         let schema = state.schema.clone();
                         GraphQLResponse::from(schema.execute(req.into_inner()).await)
                     }))
-                    .route(web::get().to(|_req: HttpRequest| async move { rustbus::graphql::routes::graphiql().await })),
+                    .route(web::get().to(graphiql_handler)),
             )
     })
     .bind(&config.bind_addr)?
