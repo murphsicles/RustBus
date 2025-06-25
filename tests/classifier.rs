@@ -16,6 +16,6 @@ mod tests {
         script.append(OP_RETURN); // 0x6a
         script.append_slice(data); // Raw data: run://test
         tx.outputs.push(TxOut { satoshis: 0, lock_script: script });
-        assert_eq!(classifier.classify(&tx), "STANDARD"); // Temporary fix
+        assert_eq!(classifier.classify(&tx), "RUN"); // Corrected expectation
     }
 }
