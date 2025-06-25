@@ -2,6 +2,7 @@ use regex::Regex;
 use std::env;
 use sv::messages::Tx;
 use crate::utils::extract_op_return;
+use hex;
 
 pub struct TransactionClassifier {
     protocols: Vec<(String, Regex)>,
@@ -36,9 +37,13 @@ impl TransactionClassifier {
 
     pub fn classify(&self, tx: &Tx) -> String {
         if let Some(op_return) = extract_op_return(tx) {
-            for (protocol, regex) in &self.protocols {
-                if regex.is_match(&op_return) {
-                    return protocol.clone();
+            // Decode the hex string to get the actual data
+            if let Ok(decoded) = hex::decode(&op_return) {
+                let decoded_str = String::from_utf8_lossy(&decoded);
+                for (protocol, regex) in &self.protocols {
+                    if regex.is_match(&decoded_str) {
+                        return protocol.clone();
+                    }
                 }
             }
         }
