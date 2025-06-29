@@ -36,6 +36,8 @@ impl TransactionClassifier {
             ("BCAT".to_string(), Regex::new(r"15PciHG22SNLQJXMoSUaWVi7WSqc7hCfva").unwrap()),
             ("AIP".to_string(), Regex::new(r"1J7Gm3UGv5R3vRjAf9nV7oJ3yF3nD4r93r").unwrap()),
             ("METANET".to_string(), Regex::new(r"1Meta").unwrap()),
+            ("D".to_string(), Regex::new(r"19iG3WTYSsbyos3uJ733yK4zEioi1FesNU").unwrap()),
+            ("TOKENIZED".to_string(), Regex::new(r"TKN").unwrap()),
         ];
 
         TransactionClassifier {
